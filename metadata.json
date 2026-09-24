@@ -1,0 +1,10 @@
+{
+  "name": "Remix Remix Remix Remix OFFICIAL: FiberX Inventory Management System V4.3",
+  "description": "Centralized web-based warehouse inventory, hardware barcode scanner listener, bulk CSV/TXT uploader, technician provisioning, and account closure enforcement for FiberX operations.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
