@@ -19,7 +19,7 @@ function isLegacyMockTech(id: string): boolean {
 }
 
 function isLegacyMockProfile(id: string): boolean {
-  return id === 'user-admin' || id === 'user-operator' || /^user-tech-0[1-4]$/.test(id);
+  return id === 'user-admin' || id === 'user-operator' || id === 'user-default' || /^user-tech-0[1-4]$/.test(id);
 }
 
 function isLegacyMockLog(id: string): boolean {
@@ -142,7 +142,12 @@ export function getStoredProfiles(): UserProfile[] {
     const parsed: UserProfile[] = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
     // Purge any legacy mock profiles from localStorage
-    const filtered = parsed.filter((profile) => !isLegacyMockProfile(profile.id));
+    const filtered = parsed.filter(
+      (profile) =>
+        !isLegacyMockProfile(profile.id) &&
+        profile.email?.toLowerCase() !== 'admin@fiberx.ph' &&
+        profile.badgeId !== 'FX-ADM-001'
+    );
     if (filtered.length !== parsed.length) {
       localStorage.setItem(STORAGE_KEYS.PROFILES, JSON.stringify(filtered));
     }
@@ -217,28 +222,32 @@ export function registerNewProfile(profileData: Omit<UserProfile, 'id'>): UserPr
 }
 
 export const EMPTY_USER_PROFILE: UserProfile = {
-  id: 'user-default',
-  name: 'Warehouse User',
-  email: 'admin@fiberx.ph',
+  id: '',
+  name: '',
+  email: '',
   role: 'ADMIN',
-  badgeId: 'FX-ADM-001',
-  department: 'Central Warehouse Operations',
+  badgeId: '',
+  department: '',
 };
 
-export function getCurrentUserProfile(): UserProfile {
+export function getCurrentUserProfile(): UserProfile | null {
   const profiles = getStoredProfiles();
   const currentId = localStorage.getItem(STORAGE_KEYS.CURRENT_USER_ID);
   const found = profiles.find((p) => p.id === currentId);
   if (found) return found;
   if (profiles.length > 0) return profiles[0];
-  return EMPTY_USER_PROFILE;
+  return null;
 }
 
-export function setCurrentUserProfile(profileId: string): UserProfile {
+export function setCurrentUserProfile(profileId: string): UserProfile | null {
   const profiles = getStoredProfiles();
-  const found = profiles.find((p) => p.id === profileId) || profiles[0] || EMPTY_USER_PROFILE;
-  localStorage.setItem(STORAGE_KEYS.CURRENT_USER_ID, found.id);
-  return found;
+  const found = profiles.find((p) => p.id === profileId);
+  if (found) {
+    localStorage.setItem(STORAGE_KEYS.CURRENT_USER_ID, found.id);
+    return found;
+  }
+  localStorage.removeItem(STORAGE_KEYS.CURRENT_USER_ID);
+  return null;
 }
 
 export function getStoredAuditLogs(): AuditLog[] {

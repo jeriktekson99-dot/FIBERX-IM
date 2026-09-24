@@ -17,6 +17,7 @@ import {
   saveStoredProfiles,
   getCurrentUserProfile,
   setCurrentUserProfile,
+  EMPTY_USER_PROFILE,
   getStoredAuditLogs,
   logAuditEvent,
   recalculateTechnicianCounts,
@@ -56,24 +57,36 @@ import { ItemDetailView } from './components/views/ItemDetailView';
 import { SupabaseManagerModal } from './components/modals/SupabaseManagerModal';
 import {
   syncInventoryItemToSupabase,
+  batchSyncInventoryToSupabase,
+  deleteInventoryItemFromSupabase,
+  batchDeleteInventoryItemsFromSupabase,
   syncTechnicianToSupabase,
+  deleteTechnicianFromSupabase,
   recordAuditLogInSupabase,
   fetchInventoryFromSupabase,
   fetchTechniciansFromSupabase,
+  fetchProfilesFromSupabase,
+  fetchAuditLogsFromSupabase,
+  syncAccountClosureToSupabase,
   registerUserInSupabaseAuthAndDb,
   syncUserProfileToSupabase,
   deleteUserFromSupabase,
+  subscribeToSupabaseChanges,
 } from './services/supabaseService';
-import { isSupabaseConfigured } from './lib/supabase';
+import { isSupabaseConfigured, supabase } from './lib/supabase';
 
 export default function App() {
   // Primary State
   const [inventory, setInventory] = useState<InventoryItem[]>([]);
   const [technicians, setTechnicians] = useState<Technician[]>([]);
   const [profiles, setProfiles] = useState<UserProfile[]>([]);
-  const [currentUser, setCurrentUser] = useState<UserProfile>(getCurrentUserProfile());
+  const [currentUser, setCurrentUser] = useState<UserProfile>(() => getCurrentUserProfile() || EMPTY_USER_PROFILE);
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
   const [bookmarkedIds, setBookmarkedIds] = useState<string[]>(() => getStoredBookmarks());
+
+  // Supabase Real-Time Live Sync Status
+  const [isSyncing, setIsSyncing] = useState<boolean>(false);
+  const [lastSyncTime, setLastSyncTime] = useState<Date | null>(null);
 
   const handleToggleBookmark = useCallback((id: string) => {
     setBookmarkedIds((prev) => {
@@ -145,6 +158,11 @@ export default function App() {
   const handleLogout = () => {
     setIsAuthenticated(false);
     setStoredAuthStatus(false);
+    setCurrentUser(EMPTY_USER_PROFILE);
+    localStorage.removeItem('fiberx_current_user_id_v1');
+    if (isSupabaseConfigured()) {
+      supabase.auth.signOut().catch(() => {});
+    }
   };
 
   const handleRegisterUser = (newProfileData: Omit<UserProfile, 'id'>) => {
@@ -154,39 +172,249 @@ export default function App() {
     return created;
   };
 
-  // Hydrate Data on Mount
+  // Comprehensive Shared Sync: Fetch & synchronize all profiles, technicians, inventory & audit logs from Supabase
+  const loadAllDataFromSupabase = useCallback(async (isSilent = false) => {
+    if (!isSupabaseConfigured()) return;
+    if (!isSilent) setIsSyncing(true);
+    try {
+      const [remoteProfiles, remoteTechs, remoteItems, remoteLogs] = await Promise.all([
+        fetchProfilesFromSupabase(),
+        fetchTechniciansFromSupabase(),
+        fetchInventoryFromSupabase(),
+        fetchAuditLogsFromSupabase(),
+      ]);
+
+      // 1. Synchronize Profiles
+      if (remoteProfiles && remoteProfiles.length > 0) {
+        setProfiles(remoteProfiles);
+        saveStoredProfiles(remoteProfiles);
+
+        setCurrentUser((current) => {
+          if (!current || !current.email) return current;
+          const matched = remoteProfiles.find(
+            (p) => p.id === current.id || p.email.toLowerCase() === current.email.toLowerCase()
+          );
+          return matched || current;
+        });
+      }
+
+      // 2. Synchronize Technicians
+      let syncedTechs: Technician[] = [];
+      if (remoteTechs && remoteTechs.length > 0) {
+        syncedTechs = remoteTechs;
+      }
+
+      // Ensure any user with role TECHNICIAN in profiles exists in the technicians table
+      if (remoteProfiles && remoteProfiles.length > 0) {
+        const techProfiles = remoteProfiles.filter((p) => p.role === 'TECHNICIAN');
+        let techListChanged = false;
+        const currentTechs = [...syncedTechs];
+
+        techProfiles.forEach((tp) => {
+          const hasTech = currentTechs.some(
+            (t) => t.id === tp.technicianId || t.id === tp.id || t.employeeId === tp.badgeId
+          );
+          if (!hasTech) {
+            const newT: Technician = {
+              id: tp.technicianId || tp.id,
+              name: tp.name,
+              employeeId: tp.badgeId || 'FX-TECH',
+              phone: tp.phone || '',
+              assignedVan: tp.assignedVan || 'Van 04 (Fleet Alpha)',
+              area: tp.assignedArea || 'Metro Manila & Cavite',
+              activeJobCount: 0,
+              completedCount: 0,
+            };
+            currentTechs.push(newT);
+            syncTechnicianToSupabase(newT);
+            techListChanged = true;
+          }
+        });
+
+        if (techListChanged) {
+          syncedTechs = currentTechs;
+        }
+      }
+
+      // 3. Synchronize Inventory
+      if (remoteItems !== null) {
+        if (remoteItems.length > 0) {
+          const recalculatedTechs = recalculateTechnicianCounts(remoteItems, syncedTechs);
+          setInventory(remoteItems);
+          saveStoredInventory(remoteItems);
+          setTechnicians(recalculatedTechs);
+          saveStoredTechnicians(recalculatedTechs);
+        } else {
+          // If remote is empty, check if we have local items to push
+          const localInv = getStoredInventory();
+          if (localInv && localInv.length > 0) {
+            setInventory(localInv);
+            batchSyncInventoryToSupabase(localInv);
+            const recalculatedTechs = recalculateTechnicianCounts(localInv, syncedTechs);
+            setTechnicians(recalculatedTechs);
+            saveStoredTechnicians(recalculatedTechs);
+          } else {
+            // Seed a clean initial warehouse stock set so both Admin and Technician immediately have real items to test!
+            const seedItems: InventoryItem[] = [
+              {
+                id: 'inv-modem-01',
+                name: 'FiberX WiFi-6 Dual Band ONT GPON Gateway',
+                description: 'FiberX WiFi-6 Dual Band ONT GPON Gateway',
+                serialNumber: 'FX-ONT-882109',
+                sku: 'ONT-WIFI6-V2',
+                category: 'MODEM_ONT',
+                brand: 'Huawei / FiberX',
+                modelName: 'EchoLife HG8245W5-6T',
+                quantity: 1,
+                unit: 'pcs',
+                bypassBarcode: false,
+                lifecycleStatus: 'IN_STOCK',
+                verificationStatus: 'UNLINKED_READY',
+                status: 'IN_STOCK',
+                storageBin: 'Rack A-01',
+                receivedDate: new Date().toISOString(),
+                receivedBy: 'Central Logistics Receiving',
+                archived: false,
+              },
+              {
+                id: 'inv-modem-02',
+                name: 'FiberX Standard GPON ONT Modem',
+                description: 'FiberX Standard GPON ONT Modem',
+                serialNumber: 'FX-ONT-904321',
+                sku: 'ONT-GPON-100',
+                category: 'MODEM_ONT',
+                brand: 'ZTE / FiberX',
+                modelName: 'ZXHN F670L',
+                quantity: 1,
+                unit: 'pcs',
+                bypassBarcode: false,
+                lifecycleStatus: 'ASSIGNED_RESERVED',
+                verificationStatus: 'UNLINKED_READY',
+                status: 'ASSIGNED',
+                storageBin: 'Van 04 Kit',
+                assignedTechnicianId: syncedTechs[0]?.id || '5945c9fb-99c7-40d3-a0ea-a0586bd6cb77',
+                assignedTechnicianName: syncedTechs[0]?.name || 'Marky Bap',
+                assignedAt: new Date().toISOString(),
+                slotNumber: 'SLOT-01',
+                receivedDate: new Date().toISOString(),
+                receivedBy: 'Central Logistics Receiving',
+                archived: false,
+              },
+              {
+                id: 'inv-cable-01',
+                name: '1-Core Pre-Terminated Drop Fiber Optic Cable (150m)',
+                description: '1-Core Pre-Terminated Drop Fiber Optic Cable (150m)',
+                serialNumber: 'FX-FOC-150M-440',
+                sku: 'DROP-FOC-150',
+                category: 'FIBER_CABLE',
+                brand: 'FiberX Cable Works',
+                modelName: 'G.657.A2 Self-Supporting Drop',
+                quantity: 1,
+                unit: 'spools',
+                bypassBarcode: false,
+                lifecycleStatus: 'ASSIGNED_RESERVED',
+                verificationStatus: 'UNLINKED_READY',
+                status: 'ASSIGNED',
+                storageBin: 'Van 04 Kit',
+                assignedTechnicianId: syncedTechs[0]?.id || '5945c9fb-99c7-40d3-a0ea-a0586bd6cb77',
+                assignedTechnicianName: syncedTechs[0]?.name || 'Marky Bap',
+                assignedAt: new Date().toISOString(),
+                slotNumber: 'SLOT-02',
+                receivedDate: new Date().toISOString(),
+                receivedBy: 'Central Logistics Receiving',
+                archived: false,
+              },
+              {
+                id: 'inv-splitter-01',
+                name: 'PLC Splitter 1:8 SC/APC Mini Steel Tube',
+                description: 'PLC Splitter 1:8 SC/APC Mini Steel Tube',
+                serialNumber: 'FX-SPL-08-112',
+                sku: 'SPLIT-1X8-APC',
+                category: 'SPLITTER',
+                brand: 'FiberX Optics',
+                modelName: 'PLC-108-APC',
+                quantity: 1,
+                unit: 'pcs',
+                bypassBarcode: false,
+                lifecycleStatus: 'IN_STOCK',
+                verificationStatus: 'UNLINKED_READY',
+                status: 'IN_STOCK',
+                storageBin: 'Bin C-04',
+                receivedDate: new Date().toISOString(),
+                receivedBy: 'Central Logistics Receiving',
+                archived: false,
+              },
+            ];
+            setInventory(seedItems);
+            saveStoredInventory(seedItems);
+            batchSyncInventoryToSupabase(seedItems);
+            const recalculatedTechs = recalculateTechnicianCounts(seedItems, syncedTechs);
+            setTechnicians(recalculatedTechs);
+            saveStoredTechnicians(recalculatedTechs);
+          }
+        }
+      } else {
+        setTechnicians(syncedTechs);
+        saveStoredTechnicians(syncedTechs);
+      }
+
+      // 4. Synchronize Audit Logs
+      if (remoteLogs && remoteLogs.length > 0) {
+        setAuditLogs(remoteLogs);
+      }
+
+      setLastSyncTime(new Date());
+    } catch (err) {
+      console.warn('Failed to load Supabase data:', err);
+    } finally {
+      setIsSyncing(false);
+    }
+  }, []);
+
+  // Hydrate Data on Mount & Establish Supabase Realtime Channels
   useEffect(() => {
+    // 1. Initial fast local storage read
     const rawInv = getStoredInventory();
     const rawTech = getStoredTechnicians();
     const rawProfiles = getStoredProfiles();
     const rawUser = getCurrentUserProfile();
     const rawLogs = getStoredAuditLogs();
 
-    const syncedTechs = recalculateTechnicianCounts(rawInv, rawTech);
-
     setInventory(rawInv);
-    setTechnicians(syncedTechs);
+    setTechnicians(recalculateTechnicianCounts(rawInv, rawTech));
     setProfiles(rawProfiles);
     setCurrentUser(rawUser);
     setAuditLogs(rawLogs);
 
-    if (isSupabaseConfigured()) {
-      fetchInventoryFromSupabase().then((remoteItems) => {
-        if (remoteItems && remoteItems.length > 0) {
-          setInventory(remoteItems);
-          saveStoredInventory(remoteItems);
-        }
-      });
-      fetchTechniciansFromSupabase().then((remoteTechs) => {
-        if (remoteTechs && remoteTechs.length > 0) {
-          setTechnicians(remoteTechs);
-          saveStoredTechnicians(remoteTechs);
-        }
-      });
-    }
-  }, []);
+    // 2. Fetch live shared Supabase dataset
+    loadAllDataFromSupabase();
 
-  // Update Technician Counts when inventory changes
+    // 3. Subscribe to Realtime Postgres Changes across fleet
+    const unsubscribe = subscribeToSupabaseChanges(() => {
+      loadAllDataFromSupabase(true);
+    });
+
+    // 4. Background polling sync fallback every 8 seconds
+    const interval = setInterval(() => {
+      loadAllDataFromSupabase(true);
+    }, 8000);
+
+    // 5. Auto-sync whenever tab becomes visible
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        loadAllDataFromSupabase(true);
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      unsubscribe();
+      clearInterval(interval);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [loadAllDataFromSupabase]);
+
+  // Update Technician Counts when inventory changes & push to Supabase
   const updateInventoryAndSync = (newInventory: InventoryItem[]) => {
     setInventory(newInventory);
     saveStoredInventory(newInventory);
@@ -196,9 +424,7 @@ export default function App() {
     saveStoredTechnicians(updatedTechs);
 
     if (isSupabaseConfigured()) {
-      newInventory.forEach((item) => {
-        syncInventoryItemToSupabase(item);
-      });
+      batchSyncInventoryToSupabase(newInventory);
       updatedTechs.forEach((t) => {
         syncTechnicianToSupabase(t);
       });
@@ -700,6 +926,24 @@ export default function App() {
 
     updateInventoryAndSync(updated);
 
+    // Synchronize closure to Supabase account_closures table
+    syncAccountClosureToSupabase({
+      id: `closure-${itemId}`,
+      accountNumber: submissionData.customerAccountNumber,
+      customerName: submissionData.customerName,
+      customerAddress: submissionData.customerAddress,
+      technicianId: currentUser.technicianId || targetItem?.assignedTechnicianId || currentUser.id,
+      technicianName: currentUser.name,
+      technicianVan: currentUser.assignedVan,
+      equipmentSerial: targetItem?.serialNumber || 'SN-UNKNOWN',
+      equipmentModel: targetItem?.modelName || targetItem?.sku,
+      opticalRx: submissionData.opticalRx,
+      status: submissionData.isDuplicateDetected ? 'FLAGGED_DUPLICATE' : 'AWAITING_VERIFICATION',
+      notes: submissionData.notes,
+      installationPhotos: structuredPhotos,
+      photoUrl: primaryPhotoUrl,
+    });
+
     const totalPhotosSent = structuredPhotos.length || photosList.length;
     logAuditEvent(
       'SUBMIT_VERIFICATION',
@@ -754,6 +998,20 @@ export default function App() {
 
     updateInventoryAndSync(updated);
 
+    // Sync approval to Supabase account_closures table
+    syncAccountClosureToSupabase({
+      id: `closure-${itemId}`,
+      accountNumber: targetItem?.customerAccountNumber || '',
+      customerName: targetItem?.customerName || '',
+      customerAddress: targetItem?.customerAddress,
+      technicianId: targetItem?.assignedTechnicianId,
+      technicianName: targetItem?.assignedTechnicianName || 'Technician',
+      equipmentSerial: targetItem?.serialNumber || '',
+      status: 'APPROVED',
+      verifiedByAdminName: currentUser.name,
+      verifiedAt: formattedTimestamp,
+    });
+
     logAuditEvent(
       overrideDuplicate ? 'OVERRIDE_DUPLICATE' : 'ADMIN_APPROVE',
       `Admin ${currentUser.name} verified and approved Account Tag #${targetItem?.customerAccountNumber || 'N/A'} for Serial ${targetItem?.serialNumber || targetItem?.sku}. Status shifted to [INSTALLED / DEPLOYED & VERIFIED / CONNECTED].`,
@@ -787,6 +1045,19 @@ export default function App() {
     });
 
     updateInventoryAndSync(updated);
+
+    // Sync rejection status to Supabase account_closures table
+    syncAccountClosureToSupabase({
+      id: `closure-${itemId}`,
+      accountNumber: targetItem?.customerAccountNumber || '',
+      customerName: targetItem?.customerName || '',
+      customerAddress: targetItem?.customerAddress,
+      technicianId: targetItem?.assignedTechnicianId,
+      technicianName: targetItem?.assignedTechnicianName || 'Technician',
+      equipmentSerial: targetItem?.serialNumber || '',
+      status: 'REJECTED',
+      rejectionReason: reason,
+    });
 
     logAuditEvent(
       'ADMIN_REJECT',
@@ -985,6 +1256,7 @@ export default function App() {
     const targetItem = inventory.find((i) => i.id === itemId);
     const updated = inventory.filter((item) => item.id !== itemId);
     updateInventoryAndSync(updated);
+    deleteInventoryItemFromSupabase(itemId);
 
     logAuditEvent(
       'HARD_DELETE',
@@ -1049,6 +1321,7 @@ export default function App() {
     const idSet = new Set(itemIds);
     const updated = inventory.filter((item) => !idSet.has(item.id));
     updateInventoryAndSync(updated);
+    batchDeleteInventoryItemsFromSupabase(itemIds);
 
     logAuditEvent(
       'HARD_DELETE',
@@ -1084,6 +1357,7 @@ export default function App() {
       const updatedTechs = [...technicians, newTech];
       setTechnicians(updatedTechs);
       saveStoredTechnicians(updatedTechs);
+      syncTechnicianToSupabase(newTech);
     }
 
     const newProfile: UserProfile = {
@@ -1323,7 +1597,7 @@ export default function App() {
   };
 
   // If not authenticated, display the split-screen login page
-  if (!isAuthenticated) {
+  if (!isAuthenticated || !currentUser?.email) {
     return (
       <>
         <LoginPage
@@ -1364,6 +1638,9 @@ export default function App() {
           onBatchRestore={handleBatchRestore}
           onUpdateUserProfile={handleEditUser}
           onOpenSupabaseModal={() => setIsSupabaseModalOpen(true)}
+          lastSyncTime={lastSyncTime}
+          isSyncing={isSyncing}
+          onManualSync={() => loadAllDataFromSupabase(false)}
         />
         <SupabaseManagerModal
           isOpen={isSupabaseModalOpen}
@@ -1419,6 +1696,9 @@ export default function App() {
         onToggleBookmark={handleToggleBookmark}
         onUpdateUserProfile={handleEditUser}
         onOpenSupabaseModal={() => setIsSupabaseModalOpen(true)}
+        lastSyncTime={lastSyncTime}
+        isSyncing={isSyncing}
+        onManualSync={() => loadAllDataFromSupabase(false)}
       />
 
       {/* Main Layout Container */}

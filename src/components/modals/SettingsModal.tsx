@@ -127,14 +127,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     }
 
     // Validation: Password change (if any password field is filled)
-    let updatedPassword = currentUser.password || 'fiberx2026';
+    let updatedPassword = currentUser.password;
     if (newPassword || confirmPassword || currentPassword) {
-      const activeCurrentPass = currentUser.password || 'fiberx2026';
-      if (!currentPassword) {
-        setErrorMsg('Please enter your current password to authorize this change.');
-        return;
-      }
-      if (currentPassword !== activeCurrentPass) {
+      if (currentUser.password && (!currentPassword || currentPassword !== currentUser.password)) {
         setErrorMsg('The current password you entered is incorrect.');
         return;
       }

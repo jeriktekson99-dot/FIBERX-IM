@@ -34,6 +34,9 @@ interface HeaderProps {
   onToggleBookmark?: (id: string) => void;
   onUpdateUserProfile?: (userId: string, updatedData: Partial<UserProfile>) => void;
   onOpenSupabaseModal?: () => void;
+  lastSyncTime?: Date | null;
+  isSyncing?: boolean;
+  onManualSync?: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -56,6 +59,9 @@ export const Header: React.FC<HeaderProps> = ({
   onToggleBookmark,
   onUpdateUserProfile,
   onOpenSupabaseModal,
+  lastSyncTime,
+  isSyncing = false,
+  onManualSync,
 }) => {
   // Dropdown States
   const [isAccountMenuOpen, setIsAccountMenuOpen] = useState(false);

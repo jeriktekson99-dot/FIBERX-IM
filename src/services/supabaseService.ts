@@ -1,5 +1,5 @@
 import { supabase, isSupabaseConfigured, PHOTO_BUCKET_NAME } from '../lib/supabase';
-import { InventoryItem, Technician, AuditLog, UserProfile } from '../types';
+import { InventoryItem, Technician, AuditLog, UserProfile, ProofPhoto } from '../types';
 
 export interface SupabaseHealthCheck {
   isConfigured: boolean;
@@ -57,11 +57,219 @@ export async function checkSupabaseHealth(): Promise<SupabaseHealthCheck> {
 }
 
 /**
+ * Fetch all registered profiles from Supabase
+ */
+export async function fetchProfilesFromSupabase(): Promise<UserProfile[] | null> {
+  if (!isSupabaseConfigured()) return null;
+  try {
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('*')
+      .order('created_at', { ascending: true });
+
+    if (error || !data) {
+      console.warn('Failed to fetch profiles from Supabase:', error?.message);
+      return null;
+    }
+
+    return data.map((row: any): UserProfile => ({
+      id: row.id,
+      name: row.name || 'FiberX User',
+      email: row.email,
+      role: (row.role as any) || 'ADMIN',
+      badgeId: row.badge_id || 'FX-USR',
+      department: row.department || 'Operations',
+      phone: row.phone || undefined,
+      status: (row.status as any) || 'ACTIVE',
+      avatarUrl: row.avatar_url || undefined,
+      createdAt: row.created_at,
+    }));
+  } catch (err) {
+    console.warn('Unexpected error in fetchProfilesFromSupabase:', err);
+    return null;
+  }
+}
+
+/**
+ * Fetch technicians from Supabase
+ */
+export async function fetchTechniciansFromSupabase(): Promise<Technician[] | null> {
+  if (!isSupabaseConfigured()) return null;
+  try {
+    const { data, error } = await supabase
+      .from('technicians')
+      .select('*')
+      .order('name', { ascending: true });
+
+    if (error || !data) return null;
+
+    return data.map((row: any): Technician => ({
+      id: row.id,
+      name: row.name,
+      employeeId: row.employee_id,
+      phone: row.phone || '',
+      assignedVan: row.assigned_van || 'Van 01',
+      area: row.area || 'Service Area',
+      isFlagged: row.is_flagged || false,
+      flagReason: row.flag_reason || undefined,
+      contactPerson: row.contact_person || undefined,
+      hubAddress: row.hub_address || undefined,
+      activeJobCount: row.active_job_count || 0,
+      completedCount: row.completed_count || 0,
+      avatarUrl: row.avatar_url || undefined,
+    }));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fetch inventory items from Supabase
+ */
+export async function fetchInventoryFromSupabase(): Promise<InventoryItem[] | null> {
+  if (!isSupabaseConfigured()) return null;
+  try {
+    const { data, error } = await supabase
+      .from('inventory_items')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (error || !data) return null;
+
+    return data.map((row: any): InventoryItem => {
+      // Check notes for serialized photo proofs or archive flags
+      let extraPhotos: string[] = [];
+      let cleanNotes = row.notes || '';
+      let isArchived = row.status === 'ARCHIVED';
+
+      if (cleanNotes.includes('[ARCHIVED]')) {
+        isArchived = true;
+        cleanNotes = cleanNotes.replace('[ARCHIVED]', '').trim();
+      }
+
+      if (cleanNotes.includes('[PHOTOS]:')) {
+        try {
+          const parts = cleanNotes.split('[PHOTOS]:');
+          cleanNotes = parts[0].trim();
+          extraPhotos = JSON.parse(parts[1]);
+        } catch {
+          // ignore parse error
+        }
+      }
+
+      // Determine proper lifecycle status
+      let lifecycleStatus: InventoryItem['lifecycleStatus'] = 'IN_STOCK';
+      if (isArchived || row.status === 'DEFECTIVE') {
+        lifecycleStatus = 'OUT_OF_STOCK_REMOVED';
+      } else if (
+        row.status === 'INSTALLED_VERIFIED' ||
+        row.status === 'INSTALLED_CLOSED' ||
+        row.status === 'INSTALLED'
+      ) {
+        lifecycleStatus = 'INSTALLED_DEPLOYED';
+      } else if (
+        row.assigned_technician_id ||
+        row.status === 'ASSIGNED' ||
+        row.status === 'AWAITING_ADMIN_VERIFICATION' ||
+        row.status === 'SUSPECTED_DUPLICATE' ||
+        row.status === 'REJECTED_INVALID_TAG'
+      ) {
+        lifecycleStatus = 'ASSIGNED_RESERVED';
+      }
+
+      // Determine verification status
+      let verificationStatus: InventoryItem['verificationStatus'] = 'UNLINKED_READY';
+      if (row.verification_status) {
+        verificationStatus = row.verification_status;
+      } else if (
+        row.status === 'AWAITING_ADMIN_VERIFICATION' ||
+        row.is_return_pending
+      ) {
+        verificationStatus = 'AWAITING_VERIFICATION';
+      } else if (
+        row.status === 'INSTALLED_VERIFIED' ||
+        row.status === 'INSTALLED_CLOSED' ||
+        row.customer_account_number
+      ) {
+        verificationStatus = 'VERIFIED_CONNECTED';
+      } else if (
+        row.status === 'SUSPECTED_DUPLICATE' ||
+        row.status === 'REJECTED_INVALID_TAG'
+      ) {
+        verificationStatus = 'FLAGGED_ACTION_REQUIRED';
+      }
+
+      const allPhotos = Array.from(
+        new Set([row.photo_url, ...(Array.isArray(extraPhotos) ? extraPhotos : [])].filter(Boolean))
+      );
+
+      return {
+        id: row.id,
+        name: row.name || 'Hardware Asset',
+        serialNumber: row.serial_number,
+        sku: row.model || row.name || 'FX-HW',
+        description: row.name || '',
+        category: row.category || 'MODEM_ONT',
+        brand: row.brand || 'FiberX',
+        modelName: row.model || 'Standard Hardware',
+        quantity: row.quantity || 1,
+        unit: row.unit || 'pcs',
+        bypassBarcode: false,
+        lifecycleStatus,
+        verificationStatus,
+        status: isArchived ? 'ARCHIVED' : row.status || 'IN_STOCK',
+        storageBin: row.current_location || 'Rack A-01',
+        assignedTechnicianId: row.assigned_technician_id || undefined,
+        assignedTechnicianName: row.assigned_technician_name || undefined,
+        assignedAt: row.assigned_at || undefined,
+        assignedByUserId: row.assigned_by_user_id || undefined,
+        assignedByUserName: row.assigned_by_user_name || undefined,
+        slotNumber: row.slot_label || undefined,
+        pairedItemId: row.paired_parent_id || undefined,
+        pairingStatus: row.paired_parent_id ? 'PAIRED' : 'UNPAIRED',
+        customerAccountNumber: row.customer_account_number || undefined,
+        customerName: row.customer_name || undefined,
+        customerAddress: row.customer_address || undefined,
+        opticalRx: row.optical_rx || undefined,
+        installationDate: row.installation_date || undefined,
+        submittedByTechnicianId: row.submitted_by_technician_id || undefined,
+        submittedByTechnicianName: row.submitted_by_technician_name || undefined,
+        submittedAt: row.submitted_at || undefined,
+        adminVerificationStatus: (row.verification_status as any) || (row.status === 'INSTALLED_VERIFIED' ? 'APPROVED' : 'PENDING'),
+        verifiedByAdminName: row.verified_by_admin_name || undefined,
+        verifiedAt: row.verified_at || undefined,
+        adminRejectionReason: row.rejection_notes || undefined,
+        photoUrl: row.photo_url || undefined,
+        photoProofUrl: row.photo_url || (allPhotos[0] || ''),
+        photoProofUrls: allPhotos,
+        photoStoragePath: row.photo_storage_path || undefined,
+        isReturnPending: Boolean(row.is_return_pending),
+        returnReason: row.return_reason || undefined,
+        notes: cleanNotes || undefined,
+        receivedDate: row.created_at || new Date().toISOString(),
+        receivedBy: 'Central Receiving',
+        archived: isArchived,
+      };
+    });
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Sync an inventory item to Supabase PostgreSQL table
  */
 export async function syncInventoryItemToSupabase(item: InventoryItem): Promise<boolean> {
   if (!isSupabaseConfigured()) return false;
   try {
+    let combinedNotes = item.notes || '';
+    if (item.archived && !combinedNotes.includes('[ARCHIVED]')) {
+      combinedNotes = `[ARCHIVED] ${combinedNotes}`.trim();
+    }
+    if (item.photoProofUrls && item.photoProofUrls.length > 1) {
+      combinedNotes = `${combinedNotes} [PHOTOS]:${JSON.stringify(item.photoProofUrls)}`;
+    }
+
     const row = {
       id: item.id,
       name: item.name,
@@ -72,8 +280,8 @@ export async function syncInventoryItemToSupabase(item: InventoryItem): Promise<
       model: item.modelName || item.sku || 'Standard Hardware',
       quantity: item.quantity || 1,
       unit: item.unit || 'pcs',
-      condition: 'GOOD',
-      status: item.status || 'IN_STOCK',
+      condition: 'GOOD_CONDITION',
+      status: item.archived ? 'ARCHIVED' : item.status || 'IN_STOCK',
       current_location: item.storageBin || 'Main Warehouse Hub',
       assigned_technician_id: item.assignedTechnicianId || null,
       assigned_technician_name: item.assignedTechnicianName || null,
@@ -97,9 +305,9 @@ export async function syncInventoryItemToSupabase(item: InventoryItem): Promise<
       rejection_notes: item.adminRejectionReason || null,
       photo_url: item.photoUrl || item.photoProofUrl || null,
       photo_storage_path: item.photoStoragePath || null,
-      is_return_pending: item.isReturnPending || false,
+      is_return_pending: Boolean(item.isReturnPending),
       return_reason: item.returnReason || null,
-      notes: item.notes || null,
+      notes: combinedNotes || null,
     };
 
     const { error } = await supabase.from('inventory_items').upsert(row, { onConflict: 'id' });
@@ -110,6 +318,100 @@ export async function syncInventoryItemToSupabase(item: InventoryItem): Promise<
     return true;
   } catch (err) {
     console.warn('Unexpected error in syncInventoryItemToSupabase:', err);
+    return false;
+  }
+}
+
+/**
+ * Batch sync inventory items to Supabase
+ */
+export async function batchSyncInventoryToSupabase(items: InventoryItem[]): Promise<boolean> {
+  if (!isSupabaseConfigured() || items.length === 0) return false;
+  try {
+    const rows = items.map((item) => {
+      let combinedNotes = item.notes || '';
+      if (item.archived && !combinedNotes.includes('[ARCHIVED]')) {
+        combinedNotes = `[ARCHIVED] ${combinedNotes}`.trim();
+      }
+      if (item.photoProofUrls && item.photoProofUrls.length > 1) {
+        combinedNotes = `${combinedNotes} [PHOTOS]:${JSON.stringify(item.photoProofUrls)}`;
+      }
+
+      return {
+        id: item.id,
+        name: item.name,
+        serial_number: item.serialNumber,
+        barcode: item.serialNumber,
+        category: item.category,
+        brand: item.brand || 'FiberX',
+        model: item.modelName || item.sku || 'Standard Hardware',
+        quantity: item.quantity || 1,
+        unit: item.unit || 'pcs',
+        condition: 'GOOD_CONDITION',
+        status: item.archived ? 'ARCHIVED' : item.status || 'IN_STOCK',
+        current_location: item.storageBin || 'Main Warehouse Hub',
+        assigned_technician_id: item.assignedTechnicianId || null,
+        assigned_technician_name: item.assignedTechnicianName || null,
+        assigned_at: item.assignedAt || null,
+        assigned_by_user_id: item.assignedByUserId || null,
+        assigned_by_user_name: item.assignedByUserName || null,
+        slot_label: item.slotNumber || null,
+        paired_parent_id: item.pairedItemId || null,
+        is_slot_tied: Boolean(item.slotNumber),
+        customer_account_number: item.customerAccountNumber || null,
+        customer_name: item.customerName || null,
+        customer_address: item.customerAddress || null,
+        optical_rx: item.opticalRx || null,
+        installation_date: item.installationDate || null,
+        submitted_by_technician_id: item.submittedByTechnicianId || null,
+        submitted_by_technician_name: item.submittedByTechnicianName || null,
+        submitted_at: item.submittedAt || null,
+        verification_status: item.verificationStatus || item.adminVerificationStatus || 'UNLINKED_READY',
+        verified_by_admin_name: item.verifiedByAdminName || null,
+        verified_at: item.verifiedAt || null,
+        rejection_notes: item.adminRejectionReason || null,
+        photo_url: item.photoUrl || item.photoProofUrl || null,
+        photo_storage_path: item.photoStoragePath || null,
+        is_return_pending: Boolean(item.isReturnPending),
+        return_reason: item.returnReason || null,
+        notes: combinedNotes || null,
+      };
+    });
+
+    const { error } = await supabase.from('inventory_items').upsert(rows, { onConflict: 'id' });
+    if (error) {
+      console.warn('Batch inventory sync failed:', error.message);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.warn('Unexpected error in batchSyncInventoryToSupabase:', err);
+    return false;
+  }
+}
+
+/**
+ * Delete single inventory item from Supabase
+ */
+export async function deleteInventoryItemFromSupabase(itemId: string): Promise<boolean> {
+  if (!isSupabaseConfigured()) return false;
+  try {
+    const { error } = await supabase.from('inventory_items').delete().eq('id', itemId);
+    return !error;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Batch delete inventory items from Supabase
+ */
+export async function batchDeleteInventoryItemsFromSupabase(itemIds: string[]): Promise<boolean> {
+  if (!isSupabaseConfigured() || itemIds.length === 0) return false;
+  try {
+    const { error } = await supabase.from('inventory_items').delete().in('id', itemIds);
+    return !error;
+  } catch {
     return false;
   }
 }
@@ -149,6 +451,50 @@ export async function syncTechnicianToSupabase(tech: Technician): Promise<boolea
 }
 
 /**
+ * Delete a technician record from Supabase
+ */
+export async function deleteTechnicianFromSupabase(techId: string): Promise<boolean> {
+  if (!isSupabaseConfigured()) return false;
+  try {
+    const { error } = await supabase.from('technicians').delete().eq('id', techId);
+    return !error;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Fetch audit logs from Supabase
+ */
+export async function fetchAuditLogsFromSupabase(): Promise<AuditLog[] | null> {
+  if (!isSupabaseConfigured()) return null;
+  try {
+    const { data, error } = await supabase
+      .from('audit_logs')
+      .select('*')
+      .order('timestamp', { ascending: false })
+      .limit(150);
+
+    if (error || !data) return null;
+
+    return data.map((row: any): AuditLog => ({
+      id: row.id,
+      action: row.action,
+      details: row.details,
+      timestamp: row.timestamp,
+      performedBy: row.user_name || 'System User',
+      role: (row.user_role as any) || 'ADMIN',
+      itemId: row.item_id || undefined,
+      itemSku: row.item_name || undefined,
+      itemSerial: row.serial_number || undefined,
+      technicianId: row.user_id || undefined,
+    }));
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Record an audit log entry in Supabase
  */
 export async function recordAuditLogInSupabase(log: AuditLog): Promise<boolean> {
@@ -180,98 +526,58 @@ export async function recordAuditLogInSupabase(log: AuditLog): Promise<boolean> 
 }
 
 /**
- * Fetch inventory items from Supabase
+ * Sync an account closure record to Supabase
  */
-export async function fetchInventoryFromSupabase(): Promise<InventoryItem[] | null> {
-  if (!isSupabaseConfigured()) return null;
+export async function syncAccountClosureToSupabase(closure: {
+  id: string;
+  accountNumber: string;
+  customerName: string;
+  customerAddress?: string;
+  technicianId?: string;
+  technicianName: string;
+  technicianVan?: string;
+  equipmentSerial: string;
+  equipmentModel?: string;
+  opticalRx?: string;
+  status?: string;
+  notes?: string;
+  installationPhotos?: any[];
+  photoUrl?: string;
+  verifiedByAdminName?: string;
+  verifiedAt?: string;
+  rejectionReason?: string;
+}): Promise<boolean> {
+  if (!isSupabaseConfigured()) return false;
   try {
-    const { data, error } = await supabase
-      .from('inventory_items')
-      .select('*')
-      .order('created_at', { ascending: false });
+    const row = {
+      id: closure.id,
+      account_number: closure.accountNumber,
+      customer_name: closure.customerName,
+      customer_address: closure.customerAddress || null,
+      technician_id: closure.technicianId || null,
+      technician_name: closure.technicianName,
+      technician_van: closure.technicianVan || null,
+      equipment_serial: closure.equipmentSerial,
+      equipment_model: closure.equipmentModel || null,
+      optical_rx: closure.opticalRx || null,
+      status: closure.status || 'AWAITING_VERIFICATION',
+      notes: closure.notes || null,
+      installation_photos: closure.installationPhotos || [],
+      photo_url: closure.photoUrl || null,
+      verified_by_admin_name: closure.verifiedByAdminName || null,
+      verified_at: closure.verifiedAt || null,
+      rejection_reason: closure.rejectionReason || null,
+    };
 
-    if (error || !data) return null;
-
-    return data.map((row: any): InventoryItem => ({
-      id: row.id,
-      name: row.name || 'Hardware Asset',
-      serialNumber: row.serial_number,
-      sku: row.model || row.name || 'FX-HW',
-      description: row.name || '',
-      category: row.category || 'MODEM_ONT',
-      brand: row.brand || 'FiberX',
-      modelName: row.model || 'Standard ONT',
-      quantity: row.quantity || 1,
-      unit: row.unit || 'pcs',
-      bypassBarcode: false,
-      lifecycleStatus: row.assigned_technician_id ? 'ASSIGNED_RESERVED' : 'IN_STOCK',
-      verificationStatus: row.verification_status || 'UNLINKED_READY',
-      status: row.status || 'IN_STOCK',
-      storageBin: row.current_location || 'Rack A-01',
-      assignedTechnicianId: row.assigned_technician_id,
-      assignedTechnicianName: row.assigned_technician_name,
-      assignedAt: row.assigned_at,
-      assignedByUserId: row.assigned_by_user_id,
-      assignedByUserName: row.assigned_by_user_name,
-      slotNumber: row.slot_label,
-      pairedItemId: row.paired_parent_id,
-      customerAccountNumber: row.customer_account_number,
-      customerName: row.customer_name,
-      customerAddress: row.customer_address,
-      opticalRx: row.optical_rx,
-      installationDate: row.installation_date,
-      submittedByTechnicianId: row.submitted_by_technician_id,
-      submittedByTechnicianName: row.submitted_by_technician_name,
-      submittedAt: row.submitted_at,
-      adminVerificationStatus: row.verification_status,
-      verifiedByAdminName: row.verified_by_admin_name,
-      verifiedAt: row.verified_at,
-      adminRejectionReason: row.rejection_notes,
-      photoUrl: row.photo_url,
-      photoProofUrl: row.photo_url,
-      photoStoragePath: row.photo_storage_path,
-      isReturnPending: row.is_return_pending,
-      returnReason: row.return_reason,
-      notes: row.notes,
-      receivedDate: row.created_at || new Date().toISOString(),
-      receivedBy: 'Central Receiving',
-      archived: false,
-    }));
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Fetch technicians from Supabase
- */
-export async function fetchTechniciansFromSupabase(): Promise<Technician[] | null> {
-  if (!isSupabaseConfigured()) return null;
-  try {
-    const { data, error } = await supabase
-      .from('technicians')
-      .select('*')
-      .order('name', { ascending: true });
-
-    if (error || !data) return null;
-
-    return data.map((row: any) => ({
-      id: row.id,
-      name: row.name,
-      employeeId: row.employee_id,
-      phone: row.phone || '',
-      assignedVan: row.assigned_van || '',
-      area: row.area || '',
-      isFlagged: row.is_flagged || false,
-      flagReason: row.flag_reason,
-      contactPerson: row.contact_person,
-      hubAddress: row.hub_address,
-      activeJobCount: row.active_job_count || 0,
-      completedCount: row.completed_count || 0,
-      avatarUrl: row.avatar_url,
-    }));
-  } catch {
-    return null;
+    const { error } = await supabase.from('account_closures').upsert(row, { onConflict: 'id' });
+    if (error) {
+      console.warn('Supabase account closure sync failed:', error.message);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.warn('Unexpected error in syncAccountClosureToSupabase:', err);
+    return false;
   }
 }
 
@@ -341,6 +647,21 @@ export async function registerUserInSupabaseAuthAndDb(
       console.warn('Supabase public.profiles upsert warning:', profileError.message);
     }
 
+    // 3. If TECHNICIAN role, ensure record exists in technicians table too
+    if (user.role === 'TECHNICIAN') {
+      const techRow = {
+        id: user.technicianId || authId,
+        name: user.name,
+        employee_id: user.badgeId,
+        phone: user.phone || null,
+        assigned_van: user.assignedVan || 'Van 01',
+        area: user.assignedArea || 'Field Operations',
+        active_job_count: 0,
+        completed_count: 0,
+      };
+      await supabase.from('technicians').upsert(techRow, { onConflict: 'id' });
+    }
+
     return {
       success: true,
       authUserId: authId,
@@ -380,6 +701,20 @@ export async function syncUserProfileToSupabase(user: UserProfile): Promise<bool
       console.warn('Supabase syncUserProfileToSupabase failed:', error.message);
       return false;
     }
+
+    // If technician, update technicians table as well
+    if (user.role === 'TECHNICIAN') {
+      const techRow = {
+        id: user.technicianId || user.id,
+        name: user.name,
+        employee_id: user.badgeId,
+        phone: user.phone || null,
+        assigned_van: user.assignedVan || 'Van 01',
+        area: user.assignedArea || 'Field Operations',
+      };
+      await supabase.from('technicians').upsert(techRow, { onConflict: 'id' });
+    }
+
     return true;
   } catch (err) {
     console.warn('Unexpected error in syncUserProfileToSupabase:', err);
@@ -388,20 +723,62 @@ export async function syncUserProfileToSupabase(user: UserProfile): Promise<bool
 }
 
 /**
- * Delete user from public.profiles in Supabase
+ * Delete user from public.profiles and technicians in Supabase
  */
 export async function deleteUserFromSupabase(userEmailOrId: string): Promise<boolean> {
   if (!isSupabaseConfigured()) return false;
   try {
     const isEmail = userEmailOrId.includes('@');
-    const query = isEmail
-      ? supabase.from('profiles').delete().eq('email', userEmailOrId.trim().toLowerCase())
-      : supabase.from('profiles').delete().eq('id', userEmailOrId);
-
-    const { error } = await query;
-    return !error;
+    if (isEmail) {
+      await supabase.from('profiles').delete().eq('email', userEmailOrId.trim().toLowerCase());
+    } else {
+      await supabase.from('profiles').delete().eq('id', userEmailOrId);
+      await supabase.from('technicians').delete().eq('id', userEmailOrId);
+    }
+    return true;
   } catch {
     return false;
   }
 }
 
+/**
+ * Subscribe to live Postgres changes across all FiberX tables
+ */
+export function subscribeToSupabaseChanges(onUpdate: (table: string, payload: any) => void): () => void {
+  if (!isSupabaseConfigured()) {
+    return () => {};
+  }
+
+  try {
+    const channelName = `fiberx_realtime_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+    const channel = supabase
+      .channel(channelName)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'inventory_items' }, (payload) => {
+        onUpdate('inventory_items', payload);
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'technicians' }, (payload) => {
+        onUpdate('technicians', payload);
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'profiles' }, (payload) => {
+        onUpdate('profiles', payload);
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'account_closures' }, (payload) => {
+        onUpdate('account_closures', payload);
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'audit_logs' }, (payload) => {
+        onUpdate('audit_logs', payload);
+      })
+      .subscribe((status) => {
+        if (status === 'SUBSCRIBED') {
+          // Channel connected
+        }
+      });
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  } catch (err) {
+    console.warn('Failed to initialize Supabase Realtime channel:', err);
+    return () => {};
+  }
+}

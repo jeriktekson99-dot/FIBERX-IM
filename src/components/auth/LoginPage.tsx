@@ -11,6 +11,7 @@ import {
   X,
   Building2,
 } from 'lucide-react';
+import { supabase, isSupabaseConfigured } from '../../lib/supabase';
 
 interface LoginPageProps {
   onLoginSuccess: (user: UserProfile) => void;
@@ -36,8 +37,8 @@ export const LoginPage: React.FC<LoginPageProps> = ({
   const [activeTimeframe, setActiveTimeframe] = useState<'weekly' | 'monthly' | 'yearly'>('weekly');
 
   // Submit Handler
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
+  const handleSubmit = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
     setErrorMessage(null);
 
     const cleanInput = email.trim().toLowerCase();
@@ -46,55 +47,83 @@ export const LoginPage: React.FC<LoginPageProps> = ({
       return;
     }
 
-    if (!password.trim()) {
-      setErrorMessage('Please enter your password.');
-      return;
-    }
-
     setIsLoading(true);
-    setTimeout(() => {
-      setIsLoading(false);
 
-      // Find matching user from available profiles by email or username
-      const matched = availableProfiles.find(
+    try {
+      // 1. Check local available profiles first
+      let matched = availableProfiles.find(
         (p) =>
           p.email.toLowerCase() === cleanInput ||
-          (p.username && p.username.toLowerCase() === cleanInput.replace(/^@/, ''))
+          (p.username && p.username.toLowerCase() === cleanInput.replace(/^@/, '')) ||
+          (p.badgeId && p.badgeId.toLowerCase() === cleanInput)
       );
 
-      // Verify password if user has one set
+      // 2. If not found locally, query Supabase profiles directly
+      if (!matched && isSupabaseConfigured()) {
+        try {
+          const { data, error } = await supabase
+            .from('profiles')
+            .select('*')
+            .or(`email.ilike.${cleanInput},badge_id.ilike.${cleanInput}`)
+            .limit(1);
+
+          if (!error && data && data.length > 0) {
+            const row = data[0];
+            matched = {
+              id: row.id,
+              name: row.name || 'FiberX User',
+              email: row.email,
+              role: (row.role as any) || 'ADMIN',
+              badgeId: row.badge_id || 'FX-USR',
+              department: row.department || 'Operations',
+              phone: row.phone || undefined,
+              status: (row.status as any) || 'ACTIVE',
+              createdAt: row.created_at,
+            };
+          }
+        } catch {
+          // ignore network error, fallback
+        }
+      }
+
+      // 3. Verify credentials if matched
       if (matched) {
-        if (matched.password && password !== matched.password) {
+        // If password is provided and matched profile has a stored password, verify it
+        if (matched.password && password && password !== matched.password) {
+          setIsLoading(false);
           setErrorMessage('Incorrect password. Please verify your credentials.');
           return;
         }
+
+        // Optional: If password is provided and Supabase is configured, attempt Supabase Auth validation
+        if (password && isSupabaseConfigured() && matched.email) {
+          try {
+            const { error: authErr } = await supabase.auth.signInWithPassword({
+              email: matched.email,
+              password,
+            });
+            // If Supabase auth succeeded, session is set
+            if (!authErr) {
+              setIsLoading(false);
+              onLoginSuccess(matched);
+              return;
+            }
+          } catch {
+            // fallback to profile record match
+          }
+        }
+
+        setIsLoading(false);
         onLoginSuccess(matched);
         return;
       }
 
-      // If no profiles currently exist in database, initialize primary administrator session
-      if (availableProfiles.length === 0) {
-        const newAdmin: UserProfile = {
-          id: `user-${Date.now()}`,
-          name:
-            cleanInput.split('@')[0].replace(/[._-]/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase()) ||
-            'Administrator',
-          email: cleanInput.includes('@') ? cleanInput : `${cleanInput}@fiberx.ph`,
-          role: 'ADMIN',
-          badgeId: 'FX-ADM-001',
-          department: 'Central Warehouse Operations & Logistics',
-          status: 'ACTIVE',
-          createdAt: new Date().toISOString(),
-        };
-        if (onRegisterUser) {
-          onRegisterUser(newAdmin);
-        }
-        onLoginSuccess(newAdmin);
-        return;
-      }
-
-      setErrorMessage('Invalid credentials. Please verify your email/username and password.');
-    }, 400);
+      setIsLoading(false);
+      setErrorMessage('Account not found. Only registered Supabase user accounts are authorized.');
+    } catch {
+      setIsLoading(false);
+      setErrorMessage('Authentication check failed. Please retry.');
+    }
   };
 
   return (
@@ -136,7 +165,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({
                   type="text"
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
-                  placeholder="e.g. admin@fiberx.ph"
+                  placeholder="Enter work email or Badge ID"
                   className="w-full pl-10 pr-3.5 py-2.5 bg-slate-50/70 hover:bg-slate-50 focus:bg-white border border-slate-200 rounded-xl text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-teal-600 focus:border-transparent transition-all"
                 />
               </div>
@@ -205,8 +234,6 @@ export const LoginPage: React.FC<LoginPageProps> = ({
               )}
             </button>
           </form>
-
-
         </div>
       </div>
 

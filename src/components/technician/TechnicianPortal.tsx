@@ -100,6 +100,9 @@ interface TechnicianPortalProps {
   onBatchRestore?: (itemIds: string[]) => void;
   onUpdateUserProfile?: (userId: string, updatedData: Partial<UserProfile>) => void;
   onOpenSupabaseModal?: () => void;
+  lastSyncTime?: Date | null;
+  isSyncing?: boolean;
+  onManualSync?: () => void;
 }
 
 type TechPortalTab = 'dashboard' | 'van_kit' | 'install_link' | 'submissions' | 'archive';
@@ -141,6 +144,9 @@ export const TechnicianPortal: React.FC<TechnicianPortalProps> = ({
   onBatchRestore,
   onUpdateUserProfile,
   onOpenSupabaseModal,
+  lastSyncTime,
+  isSyncing = false,
+  onManualSync,
 }) => {
   const [activeTab, setActiveTab] = useState<TechPortalTab>('dashboard');
   const [selectedDetailItem, setSelectedDetailItem] = useState<InventoryItem | null>(null);
