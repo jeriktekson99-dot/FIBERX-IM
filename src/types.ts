@@ -188,6 +188,8 @@ export interface InventoryItem {
   // Technician & Customer Assignment Data
   assignedTechnicianId?: string;
   assignedTechnicianName?: string;
+  assignedVan?: string; // Assigned vehicle / team van (e.g. "FX-VAN-30 (Toyota HiAce)")
+  assignmentScope?: 'INDIVIDUAL' | 'TEAM'; // Shared across team/van members vs individual custody
   assignedAt?: string;
   assignedByUserId?: string;
   assignedByUserName?: string;

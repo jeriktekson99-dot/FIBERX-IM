@@ -48,11 +48,16 @@ import {
   Radio,
   Boxes,
   Tag,
+  Users,
+  Sparkles,
 } from 'lucide-react';
 import { downloadTechnicianExcelFile } from '../../utils/excelExport';
 import {
   checkEquipmentCompatibility,
   COMPATIBILITY_RULES,
+  findAvailableModemAssociatedMaterials,
+  isModemItem,
+  MODEM_ASSOCIATED_MATERIALS_SPECS,
 } from '../../utils/equipmentPairing';
 import { FlagTechnicianModal } from './FlagTechnicianModal';
 import { WarehouseUtilizationModal } from './WarehouseUtilizationModal';
@@ -81,6 +86,7 @@ export interface AssignTechnicianModalProps {
           pairedItemName?: string;
           pairingStatus?: 'PAIRED' | 'UNPAIRED';
           slotNumber?: string;
+          assignmentScope?: 'INDIVIDUAL' | 'TEAM';
         }[]
       | string[],
     technician: Technician,
@@ -88,6 +94,7 @@ export interface AssignTechnicianModalProps {
     overrideInfo?: { isOverride: boolean; overrideReason?: string }
   ) => void;
   currentUser: UserProfile;
+  availableProfiles?: UserProfile[];
   externalScan?: { code: string; timestamp: number } | null;
   isFullPage?: boolean;
   onToggleFlagTechnician?: (technicianId: string, isFlagged: boolean, reason?: string) => void;
@@ -121,6 +128,7 @@ export const AssignTechnicianModal: React.FC<AssignTechnicianModalProps> = ({
   initialTechnicianId = '',
   onAssign,
   currentUser,
+  availableProfiles = [],
   externalScan = null,
   isFullPage = false,
   onToggleFlagTechnician,
@@ -128,6 +136,11 @@ export const AssignTechnicianModal: React.FC<AssignTechnicianModalProps> = ({
   onAddTechnician,
 }) => {
   const [selectedTechId, setSelectedTechId] = useState<string>('');
+  // Team vs Individual assignment scope (Item 1)
+  const [assignmentScope, setAssignmentScope] = useState<'TEAM' | 'INDIVIDUAL'>('TEAM');
+  // Auto-include commonly associated materials for modems (Item 2)
+  const [autoIncludeMaterials, setAutoIncludeMaterials] = useState<boolean>(true);
+
   // Map of itemId -> assigned quantity
   const [selectedItemQuantities, setSelectedItemQuantities] = useState<Map<string, number>>(new Map());
   // Custom slot mappings for newly assigned items
@@ -212,20 +225,93 @@ export const AssignTechnicianModal: React.FC<AssignTechnicianModalProps> = ({
     }
   }, []);
 
+  // Build complete list of assignable users/technicians (Item 3: Missing Users in the Assignment List)
+  const allAssignableTechnicians = useMemo(() => {
+    const list: Technician[] = [...technicians];
+
+    const isGenericBadge = (id?: string) => {
+      if (!id) return true;
+      const clean = id.trim().toUpperCase();
+      return (
+        clean === 'N/A' ||
+        clean === 'FIELD TECHNICIAN' ||
+        clean === 'TECHNICIAN' ||
+        clean === 'ADMIN' ||
+        clean === 'FX-TECH' ||
+        clean === 'FX-ADM' ||
+        clean === 'FX-USR'
+      );
+    };
+
+    // Merge active user accounts from availableProfiles that do not already have an entry in technicians
+    availableProfiles.forEach((profile) => {
+      if (profile.status === 'SUSPENDED') return;
+      const alreadyPresent = list.some(
+        (t) =>
+          t.id === profile.id ||
+          t.id === profile.technicianId ||
+          (t.name && profile.name && t.name.toLowerCase().trim() === profile.name.toLowerCase().trim()) ||
+          (!isGenericBadge(t.employeeId) && !isGenericBadge(profile.badgeId) && t.employeeId.toUpperCase() === profile.badgeId.toUpperCase())
+      );
+
+      if (!alreadyPresent) {
+        list.push({
+          id: profile.technicianId || profile.id,
+          name: profile.name,
+          employeeId: !isGenericBadge(profile.badgeId) ? profile.badgeId : `FX-${profile.role.slice(0, 3)}-${profile.id.slice(-4)}`,
+          phone: profile.phone || '',
+          assignedVan: profile.assignedVan || (profile.department?.includes('SLI') ? 'FX-VAN-30 (Toyota HiAce)' : 'Van 04 (Fleet Alpha)'),
+          area: profile.assignedArea || profile.department || 'Metro Manila Logistics',
+          activeJobCount: 0,
+          completedCount: 0,
+        });
+      }
+    });
+
+    return list;
+  }, [technicians, availableProfiles]);
+
   // Initialize modal state when opened
   useEffect(() => {
     if (isOpen) {
-      if (initialTechnicianId && technicians.some((t) => t.id === initialTechnicianId)) {
+      if (initialTechnicianId && allAssignableTechnicians.some((t) => t.id === initialTechnicianId)) {
         setSelectedTechId(initialTechnicianId);
-      } else if (technicians.length > 0) {
-        setSelectedTechId(technicians[0].id);
+      } else if (allAssignableTechnicians.length > 0) {
+        setSelectedTechId(allAssignableTechnicians[0].id);
       }
 
       if (initialItems && initialItems.length > 0) {
         const initialMap = new Map<string, number>();
+        let hasModem = false;
         initialItems.forEach((i) => {
           initialMap.set(i.id, Math.max(1, Math.min(1, i.quantity)));
+          if (isModemItem(i)) {
+            hasModem = true;
+          }
         });
+
+        // Auto-include commonly associated materials whenever a modem is assigned (Item 2)
+        if (hasModem) {
+          const selectedKeys = new Set(initialMap.keys());
+          const associated = findAvailableModemAssociatedMaterials(allInventory, selectedKeys);
+          const autoIncludedSummary: string[] = [];
+          associated.forEach(({ spec, matchedItem }) => {
+            if (matchedItem) {
+              const curMatQty = initialMap.get(matchedItem.id) || 0;
+              if (curMatQty < matchedItem.quantity) {
+                initialMap.set(matchedItem.id, curMatQty + 1);
+                autoIncludedSummary.push(`${spec.label} (${matchedItem.name})`);
+              }
+            }
+          });
+          if (autoIncludedSummary.length > 0) {
+            setFeedback({
+              text: `Auto-included associated materials for Modem: ${autoIncludedSummary.join(', ')}.`,
+              type: 'success',
+            });
+          }
+        }
+
         setSelectedItemQuantities(initialMap);
       } else {
         setSelectedItemQuantities(new Map());
@@ -245,6 +331,8 @@ export const AssignTechnicianModal: React.FC<AssignTechnicianModalProps> = ({
       setOverrideReason('');
       setShowHandledProducts(false);
       setCustodyFilter('VAN_CUSTODY');
+      setAssignmentScope('TEAM');
+      setAutoIncludeMaterials(true);
 
       const timer = setTimeout(() => {
         if (barcodeInputRef.current) {
@@ -253,11 +341,11 @@ export const AssignTechnicianModal: React.FC<AssignTechnicianModalProps> = ({
       }, 150);
       return () => clearTimeout(timer);
     }
-  }, [isOpen, initialTechnicianId, initialItems, technicians]);
+  }, [isOpen, initialTechnicianId, initialItems, allAssignableTechnicians]);
 
   const selectedTechnician = useMemo(() => {
-    return technicians.find((t) => t.id === selectedTechId) || technicians[0];
-  }, [technicians, selectedTechId]);
+    return allAssignableTechnicians.find((t) => t.id === selectedTechId) || allAssignableTechnicians[0];
+  }, [allAssignableTechnicians, selectedTechId]);
 
   // All products currently handled by this technician in their vehicle/custody
   const productsCurrentlyHandled = useMemo(() => {
@@ -355,8 +443,8 @@ export const AssignTechnicianModal: React.FC<AssignTechnicianModalProps> = ({
 
   // Distinct service areas for technician filtering
   const distinctTechAreas = useMemo(() => {
-    return Array.from(new Set(technicians.map((t) => t.area).filter(Boolean)));
-  }, [technicians]);
+    return Array.from(new Set(allAssignableTechnicians.map((t) => t.area).filter(Boolean)));
+  }, [allAssignableTechnicians]);
 
   // Live technician stats map matching the Fleet Stock Roster in TechnicianHubView
   const technicianStatsMap = useMemo(() => {
@@ -370,7 +458,7 @@ export const AssignTechnicianModal: React.FC<AssignTechnicianModalProps> = ({
       }
     > = {};
 
-    technicians.forEach((tech) => {
+    allAssignableTechnicians.forEach((tech) => {
       const activeTechItems = allInventory.filter(
         (item) =>
           !item.archived &&
@@ -425,12 +513,12 @@ export const AssignTechnicianModal: React.FC<AssignTechnicianModalProps> = ({
     });
 
     return map;
-  }, [technicians, allInventory]);
+  }, [allAssignableTechnicians, allInventory]);
 
   // Filtered technicians list with Search, Area, and Custody status
   const filteredTechnicians = useMemo(() => {
     const q = techSearch.toLowerCase().trim();
-    return technicians.filter((t) => {
+    return allAssignableTechnicians.filter((t) => {
       const matchesSearch =
         !q ||
         t.name.toLowerCase().includes(q) ||
@@ -452,7 +540,7 @@ export const AssignTechnicianModal: React.FC<AssignTechnicianModalProps> = ({
 
       return matchesSearch && matchesArea && matchesCustody;
     });
-  }, [technicians, techSearch, techAreaFilter, techCustodyFilter, technicianStatsMap]);
+  }, [allAssignableTechnicians, techSearch, techAreaFilter, techCustodyFilter, technicianStatsMap]);
 
   // Selected items objects with assigned quantities, slots, and companion pairing
   const selectedItemsWithQty = useMemo(() => {
@@ -467,8 +555,14 @@ export const AssignTechnicianModal: React.FC<AssignTechnicianModalProps> = ({
         serialNumber: string;
         category?: ItemCategory;
       };
+      isBundledMaterial?: boolean;
     }[] = [];
     let slotIndex = 1;
+
+    const hasAnyModem = Array.from(selectedItemQuantities.keys()).some((id) => {
+      const it = allInventory.find((i) => i.id === id);
+      return it ? isModemItem(it) : false;
+    });
 
     selectedItemQuantities.forEach((qty, id) => {
       const item = allInventory.find((i) => i.id === id);
@@ -502,12 +596,18 @@ export const AssignTechnicianModal: React.FC<AssignTechnicianModalProps> = ({
           isPaired = true;
         }
 
+        const isBundled =
+          hasAnyModem &&
+          !isModemItem(item) &&
+          MODEM_ASSOCIATED_MATERIALS_SPECS.some((spec) => spec.matcher(item));
+
         list.push({
           item,
           quantity: qty,
           slotNumber: assignedSlot,
           pairingStatus: isPaired ? 'PAIRED' : 'UNPAIRED',
           pairedItem: pairedItemInfo,
+          isBundledMaterial: isBundled,
         });
         slotIndex++;
       }
@@ -598,6 +698,94 @@ export const AssignTechnicianModal: React.FC<AssignTechnicianModalProps> = ({
     }
   };
 
+  // Handle item selection and auto-bundle associated materials for modems (Item 2)
+  const handleSelectItem = useCallback(
+    (found: InventoryItem) => {
+      if (found.archived) {
+        playAudioChime('warn');
+        setFeedback({
+          text: `Item [${found.serialNumber || found.sku}] is archived and cannot be assigned.`,
+          type: 'warn',
+        });
+        return;
+      }
+
+      if (found.status !== 'IN_STOCK' && !selectedItemQuantities.has(found.id)) {
+        playAudioChime('warn');
+        setFeedback({
+          text: `Item [${found.serialNumber || found.sku}] is currently [${found.status}] (${
+            found.assignedTechnicianName ? `Assigned to ${found.assignedTechnicianName}` : 'Unavailable'
+          }).`,
+          type: 'warn',
+        });
+        return;
+      }
+
+      const currentQty = selectedItemQuantities.get(found.id) || 0;
+      if (currentQty >= found.quantity) {
+        playAudioChime('warn');
+        setFeedback({
+          text: `Maximum available stock (${found.quantity} ${found.unit}) already reached for [${found.name}].`,
+          type: 'warn',
+        });
+        return;
+      }
+
+      const nextQty = currentQty + 1;
+      playAudioChime('scan');
+
+      // Check if item is a modem and autoIncludeMaterials is active
+      const isModem = isModemItem(found);
+      const autoIncludedSummary: string[] = [];
+
+      setSelectedItemQuantities((prev) => {
+        const next = new Map(prev);
+        next.set(found.id, nextQty);
+
+        if (isModem && autoIncludeMaterials) {
+          const selectedKeys = new Set(next.keys());
+          const associated = findAvailableModemAssociatedMaterials(allInventory, selectedKeys);
+          associated.forEach(({ spec, matchedItem }) => {
+            if (matchedItem) {
+              const curMatQty = next.get(matchedItem.id) || 0;
+              if (curMatQty < matchedItem.quantity) {
+                next.set(matchedItem.id, curMatQty + 1);
+                autoIncludedSummary.push(`${spec.label} (${matchedItem.name})`);
+              }
+            }
+          });
+        }
+
+        return next;
+      });
+
+      setBarcodeInput('');
+      setFeedback({
+        text:
+          currentQty === 0
+            ? `Selected: [${found.name}] — 1 of ${found.quantity} ${found.unit} available.${
+                autoIncludedSummary.length > 0
+                  ? ` Auto-included associated materials: ${autoIncludedSummary.join(', ')}.`
+                  : ''
+              }`
+            : `Incremented [${found.name}] to ${nextQty} of ${found.quantity} ${found.unit}.${
+                autoIncludedSummary.length > 0
+                  ? ` Auto-included materials: ${autoIncludedSummary.join(', ')}.`
+                  : ''
+              }`,
+        type: 'success',
+      });
+      setError(null);
+
+      setTimeout(() => {
+        if (barcodeInputRef.current) {
+          barcodeInputRef.current.focus();
+        }
+      }, 50);
+    },
+    [allInventory, selectedItemQuantities, autoIncludeMaterials, playAudioChime]
+  );
+
   // Handle barcode lookup and auto-selection
   const handleProcessBarcode = useCallback(
     (rawCode: string) => {
@@ -606,7 +794,9 @@ export const AssignTechnicianModal: React.FC<AssignTechnicianModalProps> = ({
 
       const found = allInventory.find(
         (it) =>
+          it.id === clean ||
           it.serialNumber.toUpperCase() === clean ||
+          it.serialNumber.toUpperCase().split(/\s+/).includes(clean) ||
           it.sku.toUpperCase() === clean ||
           (it.macAddress &&
             it.macAddress.replace(/[^A-Za-z0-9]/g, '').toUpperCase() ===
@@ -622,60 +812,9 @@ export const AssignTechnicianModal: React.FC<AssignTechnicianModalProps> = ({
         return;
       }
 
-      if (found.archived) {
-        playAudioChime('warn');
-        setFeedback({
-          text: `Item [${found.serialNumber}] is archived and cannot be assigned.`,
-          type: 'warn',
-        });
-        return;
-      }
-
-      if (found.status !== 'IN_STOCK' && !selectedItemQuantities.has(found.id)) {
-        playAudioChime('warn');
-        setFeedback({
-          text: `Item [${found.serialNumber}] is currently [${found.status}] (${
-            found.assignedTechnicianName ? `Assigned to ${found.assignedTechnicianName}` : 'Unavailable'
-          }).`,
-          type: 'warn',
-        });
-        return;
-      }
-
-      const currentQty = selectedItemQuantities.get(found.id) || 0;
-      if (currentQty >= found.quantity) {
-        playAudioChime('warn');
-        setFeedback({
-          text: `Maximum available stock (${found.quantity} ${found.unit}) already reached for [${found.serialNumber}].`,
-          type: 'warn',
-        });
-        return;
-      }
-
-      const nextQty = currentQty + 1;
-      playAudioChime('scan');
-      setSelectedItemQuantities((prev) => {
-        const next = new Map(prev);
-        next.set(found.id, nextQty);
-        return next;
-      });
-      setBarcodeInput('');
-      setFeedback({
-        text:
-          currentQty === 0
-            ? `Scanned & Selected: [${found.serialNumber}] (${found.name}) — 1 of ${found.quantity} ${found.unit} available.`
-            : `Incremented [${found.serialNumber}] to ${nextQty} of ${found.quantity} ${found.unit}.`,
-        type: 'success',
-      });
-      setError(null);
-
-      setTimeout(() => {
-        if (barcodeInputRef.current) {
-          barcodeInputRef.current.focus();
-        }
-      }, 50);
+      handleSelectItem(found);
     },
-    [allInventory, selectedItemQuantities, playAudioChime]
+    [allInventory, handleSelectItem, playAudioChime]
   );
 
   // Handle hardware laser scanner events
@@ -706,6 +845,20 @@ export const AssignTechnicianModal: React.FC<AssignTechnicianModalProps> = ({
       setSelectedItemQuantities((prev) => {
         const next = new Map(prev);
         next.set(itemId, current + 1);
+
+        // If incrementing a modem and autoIncludeMaterials is active, ensure associated materials match
+        if (isModemItem(item) && autoIncludeMaterials) {
+          const associated = findAvailableModemAssociatedMaterials(allInventory, new Set());
+          associated.forEach(({ matchedItem }) => {
+            if (matchedItem) {
+              const curMat = next.get(matchedItem.id) || 0;
+              if (curMat < matchedItem.quantity) {
+                next.set(matchedItem.id, curMat + 1);
+              }
+            }
+          });
+        }
+
         return next;
       });
     } else {
@@ -927,6 +1080,7 @@ export const AssignTechnicianModal: React.FC<AssignTechnicianModalProps> = ({
         pairedItemName: customPair?.pairedItemName,
         pairingStatus: customPair ? ('PAIRED' as const) : ('UNPAIRED' as const),
         slotNumber: slot,
+        assignmentScope,
       };
     });
 
@@ -1144,6 +1298,12 @@ export const AssignTechnicianModal: React.FC<AssignTechnicianModalProps> = ({
                           utilizedCount: 0,
                         };
                         const initials = getUserInitials(tech.name);
+                        const profile = availableProfiles.find(
+                          (p) =>
+                            p.id === tech.id ||
+                            p.technicianId === tech.id ||
+                            (p.name && tech.name && p.name.toLowerCase().trim() === tech.name.toLowerCase().trim())
+                        );
 
                         return (
                           <tr
@@ -1168,8 +1328,25 @@ export const AssignTechnicianModal: React.FC<AssignTechnicianModalProps> = ({
                                   {initials}
                                 </div>
                                 <div>
-                                  <p className="font-bold text-slate-900 leading-tight">{tech.name}</p>
-                                  <p className="text-[10px] font-mono text-slate-500">{tech.employeeId}</p>
+                                  <div className="flex items-center gap-1.5 flex-wrap">
+                                    <p className="font-bold text-slate-900 leading-tight">{tech.name}</p>
+                                    {profile?.role && (
+                                      <span
+                                        className={`text-[9px] font-bold px-1.5 py-0.2 rounded border ${
+                                          profile.role === 'ADMIN'
+                                            ? 'bg-purple-50 text-purple-700 border-purple-200'
+                                            : profile.role === 'OPERATOR'
+                                            ? 'bg-blue-50 text-blue-700 border-blue-200'
+                                            : 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                                        }`}
+                                      >
+                                        {profile.role}
+                                      </span>
+                                    )}
+                                  </div>
+                                  <p className="text-[10px] font-mono text-slate-500">
+                                    {tech.employeeId} {profile?.department ? `• ${profile.department}` : ''}
+                                  </p>
                                 </div>
                               </div>
                             </td>
@@ -1262,6 +1439,12 @@ export const AssignTechnicianModal: React.FC<AssignTechnicianModalProps> = ({
                     utilizedCount: 0,
                   };
                   const initials = getUserInitials(tech.name);
+                  const profile = availableProfiles.find(
+                    (p) =>
+                      p.id === tech.id ||
+                      p.technicianId === tech.id ||
+                      (p.name && tech.name && p.name.toLowerCase().trim() === tech.name.toLowerCase().trim())
+                  );
 
                   return (
                     <div
@@ -1285,8 +1468,21 @@ export const AssignTechnicianModal: React.FC<AssignTechnicianModalProps> = ({
                             {initials}
                           </div>
                           <div>
-                            <div className="flex items-center gap-1.5">
+                            <div className="flex items-center gap-1.5 flex-wrap">
                               <p className="font-bold text-xs text-slate-900">{tech.name}</p>
+                              {profile?.role && (
+                                <span
+                                  className={`text-[8px] font-bold px-1.5 py-0.2 rounded border ${
+                                    profile.role === 'ADMIN'
+                                      ? 'bg-purple-50 text-purple-700 border-purple-200'
+                                      : profile.role === 'OPERATOR'
+                                      ? 'bg-blue-50 text-blue-700 border-blue-200'
+                                      : 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                                  }`}
+                                >
+                                  {profile.role}
+                                </span>
+                              )}
                               {tech.isFlagged ? (
                                 <span className="px-1.5 py-0.2 rounded bg-amber-100 text-amber-900 border border-amber-300 text-[9px] font-bold">
                                   HOLD
@@ -2217,11 +2413,7 @@ export const AssignTechnicianModal: React.FC<AssignTechnicianModalProps> = ({
                                     ) : (
                                       <button
                                         type="button"
-                                        onClick={() =>
-                                          handleProcessBarcode(
-                                            item.serialNumber || item.sku
-                                          )
-                                        }
+                                        onClick={() => handleSelectItem(item)}
                                         className="px-2.5 py-1 text-[11px] font-bold text-teal-800 bg-teal-50 hover:bg-teal-100 border border-teal-200 rounded-md cursor-pointer transition-colors"
                                       >
                                         Select
@@ -2291,7 +2483,7 @@ export const AssignTechnicianModal: React.FC<AssignTechnicianModalProps> = ({
                 </p>
               </div>
             ) : (
-              selectedItemsWithQty.map(({ item, quantity, slotNumber, pairingStatus, pairedItem }) => {
+              selectedItemsWithQty.map(({ item, quantity, slotNumber, pairingStatus, pairedItem, isBundledMaterial }) => {
                 const itemCatDef = HARDWARE_CATEGORY_CATALOG.find((c) => c.id === item.category);
                 const ItemCatIcon = getHardwareCategoryIcon(item.category);
                 const otherBatchItems = selectedItemsWithQty
@@ -2318,6 +2510,12 @@ export const AssignTechnicianModal: React.FC<AssignTechnicianModalProps> = ({
                             <span className="inline-flex items-center gap-1 text-[9px] font-bold px-1.5 py-0.5 rounded bg-teal-50 text-teal-800 border border-teal-200">
                               <ItemCatIcon className="w-2.5 h-2.5" />
                               <span>{itemCatDef.order}. {itemCatDef.label}</span>
+                            </span>
+                          )}
+                          {isBundledMaterial && (
+                            <span className="inline-flex items-center gap-1 text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-50 text-amber-900 border border-amber-200">
+                              <Sparkles className="w-2.5 h-2.5 text-amber-600" />
+                              <span>Auto-Bundled with Modem</span>
                             </span>
                           )}
                         </div>
@@ -2524,6 +2722,93 @@ export const AssignTechnicianModal: React.FC<AssignTechnicianModalProps> = ({
 
           {/* Bottom Dispatch Controls & Form Inputs */}
           <div className="p-4 bg-white border-t border-slate-200 space-y-3 shrink-0">
+            {/* Team vs Individual Assignment Scope (Item 1) */}
+            <div className="p-3 bg-slate-50 rounded-xl border border-slate-200 space-y-2">
+              <div className="flex items-center justify-between">
+                <label className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                  <Users className="w-4 h-4 text-teal-700" />
+                  <span>Team vs Individual Assignment Scope</span>
+                </label>
+                <span
+                  className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${
+                    assignmentScope === 'TEAM'
+                      ? 'bg-teal-50 text-teal-800 border-teal-200'
+                      : 'bg-indigo-50 text-indigo-800 border-indigo-200'
+                  }`}
+                >
+                  {assignmentScope === 'TEAM' ? 'Shared Across Team' : 'Selected Account Only'}
+                </span>
+              </div>
+
+              {/* Segmented Options */}
+              <div className="grid grid-cols-2 gap-1.5 p-1 bg-slate-200/60 rounded-lg">
+                <button
+                  type="button"
+                  onClick={() => setAssignmentScope('TEAM')}
+                  className={`py-1.5 px-2 rounded-md text-xs font-bold transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
+                    assignmentScope === 'TEAM'
+                      ? 'bg-white text-teal-900 shadow-2xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  <Users className="w-3.5 h-3.5 text-teal-600" />
+                  <span>Assign to Team (Shared)</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setAssignmentScope('INDIVIDUAL')}
+                  className={`py-1.5 px-2 rounded-md text-xs font-bold transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
+                    assignmentScope === 'INDIVIDUAL'
+                      ? 'bg-white text-indigo-900 shadow-2xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  <UserCheck className="w-3.5 h-3.5 text-indigo-600" />
+                  <span>Specific Account Only</span>
+                </button>
+              </div>
+
+              {/* Explicit Scope Clarification */}
+              <p className="text-[11px] text-slate-600 leading-relaxed bg-white p-2.5 rounded-lg border border-slate-200/80">
+                {assignmentScope === 'TEAM' ? (
+                  <>
+                    <strong className="text-teal-800">✓ Shared Team Custody:</strong> Items are automatically shared across all accounts associated with <strong>{selectedTechnician?.assignedVan || 'this team'}</strong>. Any technician in this team or vehicle can view, verify, and install these materials.
+                  </>
+                ) : (
+                  <>
+                    <strong className="text-indigo-800">🔒 Specific Account Custody:</strong> Custody remains strictly locked to <strong>{selectedTechnician?.name || 'this selected account'}</strong>. Teammates in the same van will not see or access these items.
+                  </>
+                )}
+              </p>
+            </div>
+
+            {/* Auto-Include Related Materials for Modems (Item 2) */}
+            <div className="flex items-center justify-between p-3 bg-amber-50/70 rounded-xl border border-amber-200 text-xs">
+              <div className="flex items-start gap-2 pr-2">
+                <Sparkles className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                <div>
+                  <p className="font-bold text-amber-950 text-xs flex items-center gap-1.5">
+                    <span>Auto-Include Related Materials</span>
+                    <span className="text-[9px] font-bold px-1.5 py-0.2 rounded bg-amber-200/80 text-amber-900">
+                      Modem Bundle
+                    </span>
+                  </p>
+                  <p className="text-[11px] text-amber-800 mt-0.5">
+                    Automatically includes <strong>Patch Cord</strong>, <strong>NIU</strong>, <strong>SC Connector</strong>, and <strong>House Bracket</strong> whenever a modem is assigned.
+                  </p>
+                </div>
+              </div>
+              <label className="relative inline-flex items-center cursor-pointer shrink-0">
+                <input
+                  type="checkbox"
+                  checked={autoIncludeMaterials}
+                  onChange={(e) => setAutoIncludeMaterials(e.target.checked)}
+                  className="sr-only peer"
+                />
+                <div className="w-9 h-5 bg-slate-300 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-teal-600"></div>
+              </label>
+            </div>
+
             {/* Work Order & Dispatch Instructions */}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
               <div>

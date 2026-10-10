@@ -77,9 +77,9 @@ import { isSupabaseConfigured, supabase } from './lib/supabase';
 
 export default function App() {
   // Primary State
-  const [inventory, setInventory] = useState<InventoryItem[]>([]);
-  const [technicians, setTechnicians] = useState<Technician[]>([]);
-  const [profiles, setProfiles] = useState<UserProfile[]>([]);
+  const [inventory, setInventory] = useState<InventoryItem[]>(() => getStoredInventory());
+  const [technicians, setTechnicians] = useState<Technician[]>(() => getStoredTechnicians());
+  const [profiles, setProfiles] = useState<UserProfile[]>(() => getStoredProfiles());
   const [currentUser, setCurrentUser] = useState<UserProfile>(() => getCurrentUserProfile() || EMPTY_USER_PROFILE);
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
   const [bookmarkedIds, setBookmarkedIds] = useState<string[]>(() => getStoredBookmarks());
@@ -204,24 +204,42 @@ export default function App() {
         syncedTechs = remoteTechs;
       }
 
-      // Ensure any user with role TECHNICIAN in profiles exists in the technicians table
+      // Ensure any active user in profiles exists in the technicians table for assignment selection
       if (remoteProfiles && remoteProfiles.length > 0) {
-        const techProfiles = remoteProfiles.filter((p) => p.role === 'TECHNICIAN');
         let techListChanged = false;
         const currentTechs = [...syncedTechs];
 
-        techProfiles.forEach((tp) => {
-          const hasTech = currentTechs.some(
-            (t) => t.id === tp.technicianId || t.id === tp.id || t.employeeId === tp.badgeId
+        const isGenericBadge = (id?: string) => {
+          if (!id) return true;
+          const clean = id.trim().toUpperCase();
+          return (
+            clean === 'N/A' ||
+            clean === 'FIELD TECHNICIAN' ||
+            clean === 'TECHNICIAN' ||
+            clean === 'ADMIN' ||
+            clean === 'FX-TECH' ||
+            clean === 'FX-ADM' ||
+            clean === 'FX-USR'
           );
+        };
+
+        remoteProfiles.forEach((tp) => {
+          if (tp.status === 'SUSPENDED') return;
+          const hasTech = currentTechs.some((t) => {
+            if (t.id === tp.technicianId || t.id === tp.id) return true;
+            if (t.name && tp.name && t.name.toLowerCase().trim() === tp.name.toLowerCase().trim()) return true;
+            if (!isGenericBadge(t.employeeId) && !isGenericBadge(tp.badgeId) && t.employeeId.toUpperCase() === tp.badgeId.toUpperCase()) return true;
+            return false;
+          });
+
           if (!hasTech) {
             const newT: Technician = {
               id: tp.technicianId || tp.id,
               name: tp.name,
-              employeeId: tp.badgeId || 'FX-TECH',
+              employeeId: (!isGenericBadge(tp.badgeId) ? tp.badgeId : `FX-${tp.role === 'ADMIN' ? 'ADM' : 'TECH'}-${tp.id.slice(-4)}`) || 'FX-TECH',
               phone: tp.phone || '',
-              assignedVan: tp.assignedVan || 'Van 04 (Fleet Alpha)',
-              area: tp.assignedArea || 'Metro Manila & Cavite',
+              assignedVan: tp.assignedVan || (tp.department?.includes('SLI') ? 'FX-VAN-30 (Toyota HiAce)' : 'Van 04 (Fleet Alpha)'),
+              area: tp.assignedArea || tp.department || 'Metro Manila Logistics',
               activeJobCount: 0,
               completedCount: 0,
             };
@@ -629,6 +647,7 @@ export default function App() {
         pairedItemName?: string;
         pairingStatus?: 'PAIRED' | 'UNPAIRED';
         slotNumber?: string;
+        assignmentScope?: 'INDIVIDUAL' | 'TEAM';
       }
     >();
 
@@ -673,6 +692,8 @@ export default function App() {
           pairedItemId: detail?.pairedItemId || item.pairedItemId,
           pairedItemSerial: detail?.pairedItemSerial || item.pairedItemSerial,
           pairedItemName: detail?.pairedItemName || item.pairedItemName,
+          assignedVan: technician.assignedVan,
+          assignmentScope: detail?.assignmentScope || 'TEAM',
           assignedByUserId: currentUser.id,
           assignedByUserName: currentUser.name,
           assignedByUserRole: currentUser.role,
@@ -1339,31 +1360,34 @@ export default function App() {
     technicianDetails?: { assignedVan: string; area: string; phone: string }
   ) => {
     const newId = `usr_${Date.now()}`;
-    let newTechId: string | undefined = undefined;
+    const newTechId = `tech_${Date.now()}`;
 
-    // If role is TECHNICIAN, register technician entity in roster
-    if (userData.role === 'TECHNICIAN' && technicianDetails) {
-      newTechId = `tech_${Date.now()}`;
-      const newTech: Technician = {
-        id: newTechId,
-        name: userData.name,
-        employeeId: userData.badgeId,
-        phone: technicianDetails.phone,
-        assignedVan: technicianDetails.assignedVan,
-        area: technicianDetails.area,
-        activeJobCount: 0,
-        completedCount: 0,
-      };
-      const updatedTechs = [...technicians, newTech];
-      setTechnicians(updatedTechs);
-      saveStoredTechnicians(updatedTechs);
-      syncTechnicianToSupabase(newTech);
-    }
+    // Register user in technician roster so they are immediately available for inventory assignment
+    const defaultVan = userData.assignedVan || technicianDetails?.assignedVan || 'FX-VAN-30 (Toyota HiAce)';
+    const defaultArea = userData.assignedArea || technicianDetails?.area || userData.department || 'Metro Manila Logistics';
+    const defaultPhone = userData.phone || technicianDetails?.phone || '+63 900 000 0000';
+
+    const newTech: Technician = {
+      id: newTechId,
+      name: userData.name,
+      employeeId: userData.badgeId || `FX-${userData.role.slice(0, 3)}-${Date.now().toString().slice(-4)}`,
+      phone: defaultPhone,
+      assignedVan: defaultVan,
+      area: defaultArea,
+      activeJobCount: 0,
+      completedCount: 0,
+    };
+    const updatedTechs = [...technicians, newTech];
+    setTechnicians(updatedTechs);
+    saveStoredTechnicians(updatedTechs);
+    syncTechnicianToSupabase(newTech);
 
     const newProfile: UserProfile = {
       ...userData,
       id: newId,
       technicianId: newTechId,
+      assignedVan: defaultVan,
+      assignedArea: defaultArea,
     };
 
     const updatedProfiles = [...profiles, newProfile];
@@ -1755,6 +1779,7 @@ export default function App() {
               initialTechnicianId={assignModalTechId}
               onAssign={handleAssignToTechnician}
               currentUser={currentUser}
+              availableProfiles={profiles}
               externalScan={assignModalExternalScan}
               onToggleFlagTechnician={handleToggleFlagTechnician}
               onUpdateUtilization={handleUpdateUtilization}

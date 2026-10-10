@@ -298,10 +298,44 @@ export const TechnicianPortal: React.FC<TechnicianPortalProps> = ({
     );
   }, [technicians, currentUser]);
 
-  // Inventory items assigned to this specific technician
+  // Inventory items assigned to this specific technician or their shared team van (Requirement 1)
   const assignedItems = useMemo(() => {
     const curName = (currentUser?.name || '').toLowerCase().trim();
+    const curVan = (currentTech.assignedVan || currentUser?.assignedVan || '').toLowerCase().trim();
+    const curDept = (currentUser?.department || '').toLowerCase().trim();
+
+    // Identify all teammate names sharing this van, area, or department in availableProfiles
+    const teamMemberNames = new Set<string>();
+    const teamMemberIds = new Set<string>();
+    if (availableProfiles && availableProfiles.length > 0) {
+      availableProfiles.forEach((p) => {
+        if (p.status === 'SUSPENDED') return;
+        const pVan = (p.assignedVan || '').toLowerCase().trim();
+        const pDept = (p.department || '').toLowerCase().trim();
+        const sharesVan = Boolean(
+          curVan &&
+          curVan !== 'unassigned vehicle' &&
+          pVan &&
+          (pVan === curVan || pVan.includes(curVan) || curVan.includes(pVan))
+        );
+        const sharesDept = Boolean(
+          curDept &&
+          curDept !== 'central warehouse operations & network logistics' &&
+          pDept &&
+          pDept === curDept
+        );
+        if (sharesVan || sharesDept) {
+          teamMemberNames.add(p.name.toLowerCase().trim());
+          if (p.id) teamMemberIds.add(p.id);
+          if (p.technicianId) teamMemberIds.add(p.technicianId);
+        }
+      });
+    }
+
     return inventory.filter((item) => {
+      if (item.archived) return false;
+
+      // 1. Direct Assignment to this specific account
       const matchId =
         (currentTech.id && item.assignedTechnicianId === currentTech.id) ||
         (currentUser?.technicianId && item.assignedTechnicianId === currentUser.technicianId) ||
@@ -311,9 +345,34 @@ export const TechnicianPortal: React.FC<TechnicianPortalProps> = ({
         curName &&
         item.assignedTechnicianName.toLowerCase().trim() === curName
       );
-      return (matchId || matchName) && !item.archived;
+
+      if (matchId || matchName) return true;
+
+      // 2. Individual Scope: If explicitly marked INDIVIDUAL, strict custody prevents sharing with teammates
+      if (item.assignmentScope === 'INDIVIDUAL') {
+        return false;
+      }
+
+      // 3. Team Scope: Shared across all accounts associated with this team/van
+      const itemVan = (item.assignedVan || '').toLowerCase().trim();
+      const matchTeamVan = Boolean(
+        curVan &&
+        curVan !== 'unassigned vehicle' &&
+        itemVan &&
+        (itemVan === curVan ||
+          itemVan.includes(curVan) ||
+          curVan.includes(itemVan) ||
+          (item.storageBin && item.storageBin.toLowerCase().includes(curVan)))
+      );
+
+      const matchTeamMember = Boolean(
+        (item.assignedTechnicianId && teamMemberIds.has(item.assignedTechnicianId)) ||
+        (item.assignedTechnicianName && teamMemberNames.has(item.assignedTechnicianName.toLowerCase().trim()))
+      );
+
+      return matchTeamVan || matchTeamMember;
     });
-  }, [inventory, currentTech, currentUser]);
+  }, [inventory, currentTech, currentUser, availableProfiles]);
 
   // Items in Van custody (all active equipment assigned to this technician)
   const vanStockReady = useMemo(() => {

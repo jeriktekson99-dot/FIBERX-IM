@@ -133,3 +133,146 @@ export function getHardwareCategoriesPairingCatalog(
   });
 }
 
+/**
+ * Checks whether an item represents a modem/ONT gateway
+ */
+export function isModemItem(item: { category?: string; name?: string }): boolean {
+  if (item.category === 'MODEM_ONT') return true;
+  const name = (item.name || '').toLowerCase();
+  return name.includes('modem') || name.includes('ont') || name.includes('gpon') || name.includes('gateway');
+}
+
+/**
+ * Standard installation materials automatically bundled when assigning a Modem/ONT:
+ * - Patch Cord (Fiber patch jumper / SC fast connector)
+ * - NIU (Network Interface Unit / Terminal Box / Optical Rosette)
+ * - SC Connector (Mechanical connector / SC-APC fast-con)
+ * - House Bracket (Drop wire wall mounting bracket)
+ */
+export interface AssociatedMaterialRequirement {
+  key: 'PATCH_CORD' | 'NIU' | 'SC_CONNECTOR' | 'HOUSE_BRACKET';
+  label: string;
+  category: ItemCategory;
+  defaultUnit: 'pcs' | 'meters' | 'boxes';
+  defaultQtyPerModem: number;
+  matcher: (item: InventoryItem) => boolean;
+}
+
+export const MODEM_ASSOCIATED_MATERIALS_SPECS: AssociatedMaterialRequirement[] = [
+  {
+    key: 'PATCH_CORD',
+    label: 'Patch Cord',
+    category: 'PATCH_CORD',
+    defaultUnit: 'pcs',
+    defaultQtyPerModem: 1,
+    matcher: (item) => {
+      const name = (item.name || '').toLowerCase();
+      const sku = (item.sku || '').toLowerCase();
+      const cat = item.category;
+      return (
+        name.includes('patch cord') ||
+        name.includes('patch cords') ||
+        (cat === 'PATCH_CORD' && (name.includes('patch') || name.includes('cord'))) ||
+        sku.includes('patch')
+      );
+    },
+  },
+  {
+    key: 'NIU',
+    label: 'NIU (Terminal Box)',
+    category: 'ACCESSORY',
+    defaultUnit: 'pcs',
+    defaultQtyPerModem: 1,
+    matcher: (item) => {
+      const name = (item.name || '').toLowerCase();
+      const sku = (item.sku || '').toLowerCase();
+      return (
+        name.includes('niu') ||
+        sku.includes('niu') ||
+        name.includes('terminal box') ||
+        name.includes('optical rosette') ||
+        name.includes('rosette') ||
+        name.includes('atb')
+      );
+    },
+  },
+  {
+    key: 'SC_CONNECTOR',
+    label: 'SC Connector',
+    category: 'PATCH_CORD',
+    defaultUnit: 'pcs',
+    defaultQtyPerModem: 1,
+    matcher: (item) => {
+      const name = (item.name || '').toLowerCase();
+      const sku = (item.sku || '').toLowerCase();
+      return (
+        name.includes('connector') ||
+        sku.includes('connector') ||
+        name.includes('fast-con') ||
+        name.includes('mechanical') ||
+        (name.includes('sc') && !name.includes('modem') && !name.includes('splitter'))
+      );
+    },
+  },
+  {
+    key: 'HOUSE_BRACKET',
+    label: 'House Bracket',
+    category: 'ACCESSORY',
+    defaultUnit: 'pcs',
+    defaultQtyPerModem: 1,
+    matcher: (item) => {
+      const name = (item.name || '').toLowerCase();
+      const sku = (item.sku || '').toLowerCase();
+      return (
+        name.includes('house bracket') ||
+        sku.includes('house bracket') ||
+        name.includes('bracket')
+      );
+    },
+  },
+];
+
+/**
+ * Finds available warehouse in-stock candidates for each required associated material
+ */
+export function findAvailableModemAssociatedMaterials(
+  allInventory: InventoryItem[],
+  alreadySelectedIds: Set<string> = new Set()
+): {
+  spec: AssociatedMaterialRequirement;
+  matchedItem: InventoryItem | null;
+}[] {
+  const inStockCandidates = allInventory.filter(
+    (item) =>
+      !item.archived &&
+      item.quantity > 0 &&
+      (item.status === 'IN_STOCK' || item.lifecycleStatus === 'IN_STOCK')
+  );
+
+  const matchedIds = new Set<string>(alreadySelectedIds);
+
+  return MODEM_ASSOCIATED_MATERIALS_SPECS.map((spec) => {
+    // 1. Try finding an item matching the specific predicate
+    let candidate = inStockCandidates.find(
+      (item) => !matchedIds.has(item.id) && spec.matcher(item)
+    );
+
+    // 2. Fallback to any in-stock item within the matching category if available
+    if (!candidate) {
+      candidate = inStockCandidates.find(
+        (item) => !matchedIds.has(item.id) && item.category === spec.category
+      );
+    }
+
+    if (candidate) {
+      matchedIds.add(candidate.id);
+    }
+
+    return {
+      spec,
+      matchedItem: candidate || null,
+    };
+  });
+}
+
+

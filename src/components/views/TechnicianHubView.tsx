@@ -106,17 +106,26 @@ export const TechnicianHubView: React.FC<TechnicianHubViewProps> = ({
     const map: Record<string, TechnicianStats> = {};
 
     technicians.forEach((tech) => {
-      const activeTechItems = inventory.filter(
-        (item) =>
-          !item.archived &&
-          (item.assignedTechnicianId === tech.id ||
-            item.submittedByTechnicianId === tech.id ||
-            item.closedByTechnicianId === tech.id)
-      );
+      const techVan = (tech.assignedVan || '').toLowerCase().trim();
+      const activeTechItems = inventory.filter((item) => {
+        if (item.archived) return false;
+        const isDirect =
+          item.assignedTechnicianId === tech.id ||
+          item.submittedByTechnicianId === tech.id ||
+          item.closedByTechnicianId === tech.id;
+        if (isDirect) return true;
+        if (item.assignmentScope === 'INDIVIDUAL') return false;
+        const itemVan = (item.assignedVan || '').toLowerCase().trim();
+        return Boolean(
+          techVan &&
+          techVan !== 'unassigned vehicle' &&
+          itemVan &&
+          (itemVan === techVan || itemVan.includes(techVan) || techVan.includes(itemVan))
+        );
+      });
 
       const inCustody = activeTechItems.filter(
         (i) =>
-          i.assignedTechnicianId === tech.id &&
           (i.lifecycleStatus === 'ASSIGNED_RESERVED' || i.status === 'ASSIGNED') &&
           (i.verificationStatus === 'UNLINKED_READY' || !i.customerAccountNumber)
       ).reduce((sum, i) => sum + (i.quantity || 1), 0);
@@ -232,24 +241,33 @@ export const TechnicianHubView: React.FC<TechnicianHubViewProps> = ({
   // Equipment items for currently selected technician
   const selectedTechItems = useMemo(() => {
     if (!selectedTech) return [];
-    return inventory.filter(
-      (item) =>
-        !item.archived &&
-        (item.assignedTechnicianId === selectedTech.id ||
-          item.submittedByTechnicianId === selectedTech.id ||
-          item.closedByTechnicianId === selectedTech.id)
-    );
+    const techVan = (selectedTech.assignedVan || '').toLowerCase().trim();
+    return inventory.filter((item) => {
+      if (item.archived) return false;
+      const isDirect =
+        item.assignedTechnicianId === selectedTech.id ||
+        item.submittedByTechnicianId === selectedTech.id ||
+        item.closedByTechnicianId === selectedTech.id;
+      if (isDirect) return true;
+      if (item.assignmentScope === 'INDIVIDUAL') return false;
+      const itemVan = (item.assignedVan || '').toLowerCase().trim();
+      return Boolean(
+        techVan &&
+        techVan !== 'unassigned vehicle' &&
+        itemVan &&
+        (itemVan === techVan || itemVan.includes(techVan) || techVan.includes(itemVan))
+      );
+    });
   }, [selectedTech, inventory]);
 
   // Breakdown of selected technician's equipment
   const techAssignedVanItems = useMemo(() => {
     return selectedTechItems.filter(
       (i) =>
-        i.assignedTechnicianId === selectedTech?.id &&
         (i.lifecycleStatus === 'ASSIGNED_RESERVED' || i.status === 'ASSIGNED') &&
         (i.verificationStatus === 'UNLINKED_READY' || !i.customerAccountNumber)
     );
-  }, [selectedTechItems, selectedTech]);
+  }, [selectedTechItems]);
 
   const techAwaitingVerificationItems = useMemo(() => {
     return selectedTechItems.filter(
