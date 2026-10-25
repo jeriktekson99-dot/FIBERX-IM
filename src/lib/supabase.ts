@@ -2,8 +2,9 @@ import { createClient, SupabaseClient } from '@supabase/supabase-js';
 
 // Default Supabase project URL and anon key from environment variables
 const metaEnv = (import.meta as unknown as { env?: Record<string, string> }).env || {};
-const envUrl = (metaEnv.VITE_SUPABASE_URL as string | undefined)?.trim();
-const envAnonKey = (metaEnv.VITE_SUPABASE_ANON_KEY as string | undefined)?.trim();
+const processEnv = typeof process !== 'undefined' && process.env ? process.env : {};
+const envUrl = ((metaEnv.VITE_SUPABASE_URL || processEnv.VITE_SUPABASE_URL) as string | undefined)?.trim();
+const envAnonKey = ((metaEnv.VITE_SUPABASE_ANON_KEY || processEnv.VITE_SUPABASE_ANON_KEY) as string | undefined)?.trim();
 
 // Fallback dummy credentials when Supabase is not yet configured
 const DUMMY_URL = 'https://placeholder.supabase.co';

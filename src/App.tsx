@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   InventoryItem,
   Technician,
@@ -83,6 +83,8 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState<UserProfile>(() => getCurrentUserProfile() || EMPTY_USER_PROFILE);
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
   const [bookmarkedIds, setBookmarkedIds] = useState<string[]>(() => getStoredBookmarks());
+  // Shield recently mutated/dispatched items (< 45s) from being overwritten by stale background polling ticks
+  const localModifiedAtRef = useRef<Map<string, number>>(new Map());
 
   // Supabase Real-Time Live Sync Status
   const [isSyncing, setIsSyncing] = useState<boolean>(false);
@@ -257,9 +259,34 @@ export default function App() {
       // 3. Synchronize Inventory
       if (remoteItems !== null) {
         if (remoteItems.length > 0) {
-          const recalculatedTechs = recalculateTechnicianCounts(remoteItems, syncedTechs);
-          setInventory(remoteItems);
-          saveStoredInventory(remoteItems);
+          const localInv = getStoredInventory();
+          const now = Date.now();
+          const remoteMap = new Map(remoteItems.map((i) => [i.id, i]));
+
+          // Shield recently modified or recently created local items from being prematurely overwritten
+          // by stale remote data before or during Supabase sync replication
+          const mergedMap = new Map<string, InventoryItem>(remoteMap);
+
+          localInv.forEach((localItem) => {
+            const lastModified = localModifiedAtRef.current.get(localItem.id) || 0;
+            const isRecentlyModified = now - lastModified < 45000;
+
+            let isRecentlyCreated = false;
+            const match = localItem.id.match(/^item-(\d+)/);
+            if (match) {
+              const ts = parseInt(match[1], 10);
+              if (now - ts < 60000) isRecentlyCreated = true;
+            }
+
+            if (isRecentlyModified || (isRecentlyCreated && !mergedMap.has(localItem.id))) {
+              mergedMap.set(localItem.id, localItem);
+            }
+          });
+
+          const mergedItems = Array.from(mergedMap.values());
+          const recalculatedTechs = recalculateTechnicianCounts(mergedItems, syncedTechs);
+          setInventory(mergedItems);
+          saveStoredInventory(mergedItems);
           setTechnicians(recalculatedTechs);
           saveStoredTechnicians(recalculatedTechs);
         } else {
@@ -433,7 +460,15 @@ export default function App() {
   }, [loadAllDataFromSupabase]);
 
   // Update Technician Counts when inventory changes & push to Supabase
-  const updateInventoryAndSync = (newInventory: InventoryItem[]) => {
+  const updateInventoryAndSync = async (newInventory: InventoryItem[]) => {
+    // Record current timestamp for items that are assigned or in workflow
+    const now = Date.now();
+    newInventory.forEach((item) => {
+      if (item.assignedTechnicianId || item.lifecycleStatus !== 'IN_STOCK' || item.status !== 'IN_STOCK') {
+        localModifiedAtRef.current.set(item.id, now);
+      }
+    });
+
     setInventory(newInventory);
     saveStoredInventory(newInventory);
 
@@ -442,10 +477,9 @@ export default function App() {
     saveStoredTechnicians(updatedTechs);
 
     if (isSupabaseConfigured()) {
-      batchSyncInventoryToSupabase(newInventory);
-      updatedTechs.forEach((t) => {
-        syncTechnicianToSupabase(t);
-      });
+      // First ensure technicians are synced to satisfy foreign key constraints in Supabase PostgreSQL
+      await Promise.all(updatedTechs.map((t) => syncTechnicianToSupabase(t)));
+      await batchSyncInventoryToSupabase(newInventory);
     }
   };
 
@@ -540,12 +574,66 @@ export default function App() {
 
   // 1. Receive Single Stock
   const handleReceiveStock = (itemData: Omit<InventoryItem, 'id'>) => {
+    const isMaterial = Boolean(
+      itemData.bypassBarcode ||
+        !itemData.serialNumber ||
+        itemData.category === 'ACCESSORY' ||
+        itemData.category === 'PATCH_CORD'
+    );
+
+    // Check if this material or item already exists unassigned in stock in the same warehouse bin
+    const existingMatch = inventory.find((it) => {
+      if (it.status !== 'IN_STOCK' || it.assignedTechnicianId || it.archived) return false;
+      // If user provided a specific serial number and item has one:
+      if (itemData.serialNumber && it.serialNumber) {
+        return it.serialNumber.trim().toUpperCase() === itemData.serialNumber.trim().toUpperCase();
+      }
+      // If non-barcoded material / accessory: match on SKU or exact name in same storage bin
+      if (isMaterial) {
+        const sameBin = (it.storageBin || '').trim().toLowerCase() === (itemData.storageBin || '').trim().toLowerCase();
+        const sameSku = Boolean(itemData.sku && it.sku && it.sku.trim().toUpperCase() === itemData.sku.trim().toUpperCase());
+        const sameName = it.name.trim().toLowerCase() === itemData.name.trim().toLowerCase();
+        return sameBin && (sameSku || sameName);
+      }
+      return false;
+    });
+
+    if (existingMatch) {
+      // Replenish existing stock entry
+      const addedQty = Math.max(1, Number(itemData.quantity) || 1);
+      const updatedItem: InventoryItem = {
+        ...existingMatch,
+        quantity: (Number(existingMatch.quantity) || 1) + addedQty,
+        notes: itemData.notes
+          ? `${existingMatch.notes || ''} [Intake +${addedQty} on ${new Date().toLocaleDateString()}]: ${itemData.notes}`.trim()
+          : existingMatch.notes,
+      };
+      const updated = inventory.map((it) => (it.id === existingMatch.id ? updatedItem : it));
+      updateInventoryAndSync(updated);
+
+      logAuditEvent(
+        'RECEIVE',
+        `Stock replenished: +${addedQty} ${updatedItem.unit || 'units'} to ${updatedItem.name} in ${updatedItem.storageBin} (New Stock Count: ${updatedItem.quantity})`,
+        currentUser,
+        updatedItem
+      );
+      setAuditLogs(getStoredAuditLogs());
+
+      showToast(`Stock Replenished: Added ${addedQty} ${updatedItem.unit || 'units'} to ${updatedItem.name} (Total: ${updatedItem.quantity})`, 'emerald');
+      setCurrentTab('inventory');
+      setFilterState((prev) => ({ ...prev, viewMode: 'active' }));
+      return;
+    }
+
     const newItem: InventoryItem = {
       ...itemData,
       id: `item-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+      serialNumber: (itemData.serialNumber || '').trim(),
+      bypassBarcode: isMaterial || !itemData.serialNumber,
       lifecycleStatus: itemData.lifecycleStatus || 'IN_STOCK',
       verificationStatus: itemData.verificationStatus || 'UNLINKED_READY',
       status: 'IN_STOCK',
+      quantity: Math.max(1, Number(itemData.quantity) || 1),
     };
 
     const updated = [newItem, ...inventory];
@@ -553,13 +641,13 @@ export default function App() {
 
     logAuditEvent(
       'RECEIVE',
-      `Stock received: ${newItem.serialNumber || '[Non-barcoded]'} (${newItem.name}) into ${newItem.storageBin}`,
+      `Stock received: ${newItem.serialNumber || '[Non-barcoded]'} (${newItem.name} x${newItem.quantity}) into ${newItem.storageBin}`,
       currentUser,
       newItem
     );
     setAuditLogs(getStoredAuditLogs());
 
-    showToast(`Stock Received: ${newItem.name} added to ${newItem.storageBin}`, 'emerald');
+    showToast(`Stock Received: ${newItem.name} (${newItem.quantity} ${newItem.unit || 'pcs'}) added to ${newItem.storageBin}`, 'emerald');
     // Ensure the stock inventory view is immediately active and reflecting the new product
     setCurrentTab('inventory');
     setFilterState((prev) => ({ ...prev, viewMode: 'active' }));
@@ -569,27 +657,95 @@ export default function App() {
   const handleBatchReceiveStock = (itemsData: Omit<InventoryItem, 'id'>[]) => {
     if (itemsData.length === 0) return;
     const now = Date.now();
-    const newItems: InventoryItem[] = itemsData.map((itemData, index) => ({
-      ...itemData,
-      id: `item-${now}-${index}-${Math.floor(Math.random() * 1000)}`,
-      lifecycleStatus: itemData.lifecycleStatus || 'IN_STOCK',
-      verificationStatus: itemData.verificationStatus || 'UNLINKED_READY',
-      status: 'IN_STOCK',
-    }));
+    let currentInventory = [...inventory];
+    const newItemsToCreate: InventoryItem[] = [];
+    let replenishedCount = 0;
 
-    const totalUnits = newItems.reduce((sum, item) => sum + (item.quantity || 1), 0);
-    const updated = [...newItems, ...inventory];
-    updateInventoryAndSync(updated);
+    itemsData.forEach((itemData, index) => {
+      const isMaterial = Boolean(
+        itemData.bypassBarcode ||
+          !itemData.serialNumber ||
+          itemData.category === 'ACCESSORY' ||
+          itemData.category === 'PATCH_CORD'
+      );
+
+      // Check if this material matches an existing unassigned warehouse record
+      const existingIdx = currentInventory.findIndex((it) => {
+        if (it.status !== 'IN_STOCK' || it.assignedTechnicianId || it.archived) return false;
+        if (itemData.serialNumber && it.serialNumber) {
+          return it.serialNumber.trim().toUpperCase() === itemData.serialNumber.trim().toUpperCase();
+        }
+        if (isMaterial) {
+          const sameBin = (it.storageBin || '').trim().toLowerCase() === (itemData.storageBin || '').trim().toLowerCase();
+          const sameSku = Boolean(itemData.sku && it.sku && it.sku.trim().toUpperCase() === itemData.sku.trim().toUpperCase());
+          const sameName = it.name.trim().toLowerCase() === itemData.name.trim().toLowerCase();
+          return sameBin && (sameSku || sameName);
+        }
+        return false;
+      });
+
+      const addedQty = Math.max(1, Number(itemData.quantity) || 1);
+
+      if (existingIdx !== -1) {
+        // Replenish existing item
+        currentInventory[existingIdx] = {
+          ...currentInventory[existingIdx],
+          quantity: (Number(currentInventory[existingIdx].quantity) || 1) + addedQty,
+        };
+        replenishedCount += addedQty;
+      } else {
+        // Check if an item in newItemsToCreate matches
+        const batchExistingIdx = newItemsToCreate.findIndex((it) => {
+          if (itemData.serialNumber && it.serialNumber) {
+            return it.serialNumber.trim().toUpperCase() === itemData.serialNumber.trim().toUpperCase();
+          }
+          if (isMaterial) {
+            const sameBin = (it.storageBin || '').trim().toLowerCase() === (itemData.storageBin || '').trim().toLowerCase();
+            const sameSku = Boolean(itemData.sku && it.sku && it.sku.trim().toUpperCase() === itemData.sku.trim().toUpperCase());
+            const sameName = it.name.trim().toLowerCase() === itemData.name.trim().toLowerCase();
+            return sameBin && (sameSku || sameName);
+          }
+          return false;
+        });
+
+        if (batchExistingIdx !== -1) {
+          newItemsToCreate[batchExistingIdx] = {
+            ...newItemsToCreate[batchExistingIdx],
+            quantity: (Number(newItemsToCreate[batchExistingIdx].quantity) || 1) + addedQty,
+          };
+          replenishedCount += addedQty;
+        } else {
+          newItemsToCreate.push({
+            ...itemData,
+            id: `item-${now}-${index}-${Math.floor(Math.random() * 1000)}`,
+            serialNumber: (itemData.serialNumber || '').trim(),
+            bypassBarcode: isMaterial || !itemData.serialNumber,
+            lifecycleStatus: itemData.lifecycleStatus || 'IN_STOCK',
+            verificationStatus: itemData.verificationStatus || 'UNLINKED_READY',
+            status: 'IN_STOCK',
+            quantity: addedQty,
+          });
+        }
+      }
+    });
+
+    const finalInventory = [...newItemsToCreate, ...currentInventory];
+    updateInventoryAndSync(finalInventory);
+
+    const totalNewUnits = newItemsToCreate.reduce((sum, item) => sum + (item.quantity || 1), 0);
+    const totalReceivedUnits = totalNewUnits + replenishedCount;
 
     logAuditEvent(
       'BULK_IMPORT',
-      `Bulk received ${totalUnits} unit(s) across ${newItems.length} entries (${newItems[0]?.name}) via barcode scanner batch`,
+      `Batch received ${totalReceivedUnits} unit(s) (${newItemsToCreate.length} new records, ${replenishedCount} replenished units) into stock`,
       currentUser
     );
     setAuditLogs(getStoredAuditLogs());
 
-    showToast(`Batch Received: Successfully added ${totalUnits} unit(s) to Stock Inventory`, 'emerald');
-    // Ensure the stock inventory view is immediately active and reflecting the new products
+    showToast(
+      `Batch Received: Successfully added ${totalReceivedUnits} unit(s) into Warehouse Inventory`,
+      'emerald'
+    );
     setCurrentTab('inventory');
     setFilterState((prev) => ({ ...prev, viewMode: 'active' }));
   };
@@ -706,9 +862,15 @@ export default function App() {
           flagOverrideReason: overrideInfo?.overrideReason,
         };
 
+        const isMaterial =
+          item.category === 'PATCH_CORD' ||
+          item.category === 'ACCESSORY' ||
+          item.bypassBarcode ||
+          !item.serialNumber;
+
         if (assignQty >= item.quantity) {
           // Entire item stock transferred to technician
-          newInventoryList.push({
+          const assignedItem: InventoryItem = {
             ...item,
             ...assignmentMetadata,
             quantity: assignQty,
@@ -719,22 +881,30 @@ export default function App() {
             assignedTechnicianName: technician.name,
             assignedAt: timestamp,
             storageBin: `${technician.assignedVan} / Transit`,
+            bypassBarcode: isMaterial ? true : item.bypassBarcode,
             notes: dispatchNotes
               ? `${item.notes ? item.notes + ' | ' : ''}${dispatchNotes}`
               : item.notes,
-          });
+          };
+          newInventoryList.push(assignedItem);
+          localModifiedAtRef.current.set(assignedItem.id, Date.now());
         } else {
           // Partial quantity assigned: remaining units remain in stock
-          newInventoryList.push({
+          const remainingItem: InventoryItem = {
             ...item,
             quantity: item.quantity - assignQty,
-          });
+          };
+          newInventoryList.push(remainingItem);
+          localModifiedAtRef.current.set(remainingItem.id, Date.now());
 
           // Dispatched portion becomes assigned to technician
-          newInventoryList.push({
+          const dispatchedId = `item-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+          const dispatchedItem: InventoryItem = {
             ...item,
             ...assignmentMetadata,
-            id: `item-${Date.now()}-${Math.floor(Math.random() * 10000)}`,
+            id: dispatchedId,
+            serialNumber: isMaterial ? '' : (item.serialNumber ? `${item.serialNumber}_DISP_${dispatchedId.slice(-4)}` : ''),
+            bypassBarcode: isMaterial || !item.serialNumber,
             quantity: assignQty,
             lifecycleStatus: 'ASSIGNED_RESERVED' as const,
             verificationStatus: 'UNLINKED_READY' as const,
@@ -746,7 +916,9 @@ export default function App() {
             notes: dispatchNotes
               ? `${item.notes ? item.notes + ' | ' : ''}${dispatchNotes}`
               : item.notes,
-          });
+          };
+          newInventoryList.push(dispatchedItem);
+          localModifiedAtRef.current.set(dispatchedItem.id, Date.now());
         }
       } else {
         newInventoryList.push(item);

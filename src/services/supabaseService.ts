@@ -203,18 +203,22 @@ export async function fetchInventoryFromSupabase(): Promise<InventoryItem[] | nu
         new Set([row.photo_url, ...(Array.isArray(extraPhotos) ? extraPhotos : [])].filter(Boolean))
       );
 
+      const rawSerial = (row.serial_number || '').trim();
+      const isNonBarcoded = !rawSerial || rawSerial.startsWith('NON_BARCODED_');
+      const cleanSerial = isNonBarcoded ? '' : rawSerial.replace(/(_LOT_|_DISPATCH_)[A-Za-z0-9]+$/, '');
+
       return {
         id: row.id,
         name: row.name || 'Hardware Asset',
-        serialNumber: row.serial_number,
+        serialNumber: cleanSerial,
         sku: row.model || row.name || 'FX-HW',
         description: row.name || '',
         category: row.category || 'MODEM_ONT',
         brand: row.brand || 'FiberX',
         modelName: row.model || 'Standard Hardware',
-        quantity: row.quantity || 1,
+        quantity: Number(row.quantity) || 1,
         unit: row.unit || 'pcs',
-        bypassBarcode: false,
+        bypassBarcode: isNonBarcoded || !cleanSerial,
         lifecycleStatus,
         verificationStatus,
         status: isArchived ? 'ARCHIVED' : row.status || 'IN_STOCK',
@@ -257,6 +261,34 @@ export async function fetchInventoryFromSupabase(): Promise<InventoryItem[] | nu
 }
 
 /**
+ * Format a serial number for Supabase storage that satisfies the NOT NULL and UNIQUE constraints
+ */
+export function toDbSerialNumber(item: InventoryItem): string {
+  const raw = (item.serialNumber || '').trim();
+  const isGenericMaterial =
+    !raw ||
+    item.bypassBarcode ||
+    raw.startsWith('NON_BARCODED_') ||
+    item.category === 'PATCH_CORD' ||
+    item.category === 'ACCESSORY';
+
+  if (isGenericMaterial) {
+    if (
+      !raw ||
+      item.bypassBarcode ||
+      raw.includes(';') ||
+      raw === 'NIU' ||
+      raw.startsWith('NON_BARCODED_') ||
+      item.category === 'PATCH_CORD' ||
+      item.category === 'ACCESSORY'
+    ) {
+      return `NON_BARCODED_${item.id}`;
+    }
+  }
+  return raw;
+}
+
+/**
  * Sync an inventory item to Supabase PostgreSQL table
  */
 export async function syncInventoryItemToSupabase(item: InventoryItem): Promise<boolean> {
@@ -270,15 +302,56 @@ export async function syncInventoryItemToSupabase(item: InventoryItem): Promise<
       combinedNotes = `${combinedNotes} [PHOTOS]:${JSON.stringify(item.photoProofUrls)}`;
     }
 
+    let dbSerial = toDbSerialNumber(item);
+
+    // If item has a real serial number, check if another item already has it in Supabase
+    if (!item.bypassBarcode && item.serialNumber && item.serialNumber.trim()) {
+      const { data: collisions } = await supabase
+        .from('inventory_items')
+        .select('id')
+        .eq('serial_number', dbSerial)
+        .neq('id', item.id)
+        .limit(1);
+
+      if (collisions && collisions.length > 0) {
+        dbSerial = `${dbSerial}_LOT_${item.id.replace(/[^A-Za-z0-9]/g, '').slice(-6)}`;
+      }
+    }
+
+    // Auto-provision referenced technician to guarantee foreign key satisfaction
+    if (item.assignedTechnicianId) {
+      const { data: techExists } = await supabase
+        .from('technicians')
+        .select('id')
+        .eq('id', item.assignedTechnicianId)
+        .maybeSingle();
+
+      if (!techExists) {
+        await supabase.from('technicians').upsert(
+          {
+            id: item.assignedTechnicianId,
+            name: item.assignedTechnicianName || 'Field Technician',
+            employee_id: `FX-TECH-${String(item.assignedTechnicianId).slice(-4)}`,
+            phone: '',
+            assigned_van: item.assignedVan || 'Van Transit',
+            area: 'Operations',
+            active_job_count: 0,
+            completed_count: 0,
+          },
+          { onConflict: 'id' }
+        );
+      }
+    }
+
     const row = {
       id: item.id,
-      name: item.name,
-      serial_number: item.serialNumber,
-      barcode: item.serialNumber,
-      category: item.category,
+      name: item.name || 'Hardware Asset',
+      serial_number: dbSerial,
+      barcode: dbSerial,
+      category: item.category || 'MODEM_ONT',
       brand: item.brand || 'FiberX',
       model: item.modelName || item.sku || 'Standard Hardware',
-      quantity: item.quantity || 1,
+      quantity: Number(item.quantity) || 1,
       unit: item.unit || 'pcs',
       condition: 'GOOD_CONDITION',
       status: item.archived ? 'ARCHIVED' : item.status || 'IN_STOCK',
@@ -312,6 +385,20 @@ export async function syncInventoryItemToSupabase(item: InventoryItem): Promise<
 
     const { error } = await supabase.from('inventory_items').upsert(row, { onConflict: 'id' });
     if (error) {
+      if (error.code === '23505') {
+        // Retry with guaranteed unique serial suffix
+        const disambiguated = {
+          ...row,
+          serial_number: `${row.serial_number}_LOT_${item.id.replace(/[^A-Za-z0-9]/g, '').slice(-6)}`,
+          barcode: `${row.barcode}_LOT_${item.id.replace(/[^A-Za-z0-9]/g, '').slice(-6)}`,
+        };
+        const { error: retryError } = await supabase.from('inventory_items').upsert(disambiguated, { onConflict: 'id' });
+        if (retryError) {
+          console.warn('Supabase retry inventory sync failed:', retryError.message);
+          return false;
+        }
+        return true;
+      }
       console.warn('Supabase inventory sync failed:', error.message);
       return false;
     }
@@ -323,11 +410,13 @@ export async function syncInventoryItemToSupabase(item: InventoryItem): Promise<
 }
 
 /**
- * Batch sync inventory items to Supabase
+ * Batch sync inventory items to Supabase with chunking and per-item fallback
  */
 export async function batchSyncInventoryToSupabase(items: InventoryItem[]): Promise<boolean> {
   if (!isSupabaseConfigured() || items.length === 0) return false;
   try {
+    const usedSerials = new Set<string>();
+
     const rows = items.map((item) => {
       let combinedNotes = item.notes || '';
       if (item.archived && !combinedNotes.includes('[ARCHIVED]')) {
@@ -337,15 +426,21 @@ export async function batchSyncInventoryToSupabase(items: InventoryItem[]): Prom
         combinedNotes = `${combinedNotes} [PHOTOS]:${JSON.stringify(item.photoProofUrls)}`;
       }
 
+      let dbSerial = toDbSerialNumber(item);
+      if (usedSerials.has(dbSerial)) {
+        dbSerial = `${dbSerial}_LOT_${item.id.replace(/[^A-Za-z0-9]/g, '').slice(-6)}`;
+      }
+      usedSerials.add(dbSerial);
+
       return {
         id: item.id,
-        name: item.name,
-        serial_number: item.serialNumber,
-        barcode: item.serialNumber,
-        category: item.category,
+        name: item.name || 'Hardware Asset',
+        serial_number: dbSerial,
+        barcode: dbSerial,
+        category: item.category || 'MODEM_ONT',
         brand: item.brand || 'FiberX',
         model: item.modelName || item.sku || 'Standard Hardware',
-        quantity: item.quantity || 1,
+        quantity: Number(item.quantity) || 1,
         unit: item.unit || 'pcs',
         condition: 'GOOD_CONDITION',
         status: item.archived ? 'ARCHIVED' : item.status || 'IN_STOCK',
@@ -378,12 +473,71 @@ export async function batchSyncInventoryToSupabase(items: InventoryItem[]): Prom
       };
     });
 
-    const { error } = await supabase.from('inventory_items').upsert(rows, { onConflict: 'id' });
-    if (error) {
-      console.warn('Batch inventory sync failed:', error.message);
-      return false;
+    // Auto-provision all referenced technician IDs to prevent foreign key constraint violations
+    const techIds = Array.from(new Set(rows.map((r) => r.assigned_technician_id).filter(Boolean))) as string[];
+    if (techIds.length > 0) {
+      const { data: existingTechs } = await supabase
+        .from('technicians')
+        .select('id')
+        .in('id', techIds);
+      const existingSet = new Set((existingTechs || []).map((t) => t.id));
+      const missingTechIds = techIds.filter((id) => !existingSet.has(id));
+
+      if (missingTechIds.length > 0) {
+        const missingRows = missingTechIds.map((techId) => {
+          const sampleItem = rows.find((r) => r.assigned_technician_id === techId);
+          return {
+            id: techId,
+            name: sampleItem?.assigned_technician_name || 'Field Technician',
+            employee_id: `FX-TECH-${String(techId).slice(-4)}`,
+            phone: '',
+            assigned_van: 'Van Transit',
+            area: 'Operations',
+            active_job_count: 0,
+            completed_count: 0,
+          };
+        });
+        await supabase.from('technicians').upsert(missingRows, { onConflict: 'id' });
+      }
     }
-    return true;
+
+    const CHUNK_SIZE = 40;
+    let allSucceeded = true;
+
+    for (let i = 0; i < rows.length; i += CHUNK_SIZE) {
+      const chunk = rows.slice(i, i + CHUNK_SIZE);
+      const { error } = await supabase.from('inventory_items').upsert(chunk, { onConflict: 'id' });
+      if (error) {
+        console.warn(`Batch chunk [${i}-${i + chunk.length}] error: ${error.message}. Running resilient single upserts...`);
+        for (const singleRow of chunk) {
+          const { error: singleErr } = await supabase
+            .from('inventory_items')
+            .upsert(singleRow, { onConflict: 'id' });
+
+          if (singleErr) {
+            if (singleErr.code === '23505') {
+              const disambiguated = {
+                ...singleRow,
+                serial_number: `${singleRow.serial_number}_LOT_${singleRow.id.replace(/[^A-Za-z0-9]/g, '').slice(-6)}`,
+                barcode: `${singleRow.barcode}_LOT_${singleRow.id.replace(/[^A-Za-z0-9]/g, '').slice(-6)}`,
+              };
+              const { error: retryErr } = await supabase
+                .from('inventory_items')
+                .upsert(disambiguated, { onConflict: 'id' });
+              if (retryErr) {
+                console.error(`Failed to upsert item ${singleRow.id}:`, retryErr.message);
+                allSucceeded = false;
+              }
+            } else {
+              console.error(`Failed to upsert item ${singleRow.id}:`, singleErr.message);
+              allSucceeded = false;
+            }
+          }
+        }
+      }
+    }
+
+    return allSucceeded;
   } catch (err) {
     console.warn('Unexpected error in batchSyncInventoryToSupabase:', err);
     return false;

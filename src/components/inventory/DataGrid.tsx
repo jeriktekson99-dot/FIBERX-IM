@@ -97,7 +97,12 @@ export const DataGrid: React.FC<DataGridProps> = ({
 
     // Field tech personal view filter
     if (currentUser.role === 'TECHNICIAN' && currentUser.technicianId) {
-      if (item.assignedTechnicianId !== currentUser.technicianId) return false;
+      const userVan = (currentUser.assignedVan || '').toLowerCase().trim();
+      const itemVan = (item.assignedVan || '').toLowerCase().trim();
+      const isAssignedToUser =
+        item.assignedTechnicianId === currentUser.technicianId ||
+        Boolean(userVan && userVan !== 'unassigned vehicle' && itemVan && (itemVan === userVan || itemVan.includes(userVan) || userVan.includes(itemVan)));
+      if (!isAssignedToUser) return false;
     }
 
     // Category filter
@@ -138,8 +143,14 @@ export const DataGrid: React.FC<DataGridProps> = ({
     }
 
     // Technician filter
-    if (filterState.technicianId && filterState.technicianId !== 'ALL' && item.assignedTechnicianId !== filterState.technicianId) {
-      return false;
+    if (filterState.technicianId && filterState.technicianId !== 'ALL') {
+      const selectedT = technicians.find((t) => t.id === filterState.technicianId);
+      const techVan = (selectedT?.assignedVan || '').toLowerCase().trim();
+      const itemVan = (item.assignedVan || '').toLowerCase().trim();
+      const matchesTech =
+        item.assignedTechnicianId === filterState.technicianId ||
+        Boolean(selectedT && techVan && techVan !== 'unassigned vehicle' && itemVan && (itemVan === techVan || itemVan.includes(techVan) || techVan.includes(itemVan)));
+      if (!matchesTech) return false;
     }
 
     // Unclosed filter

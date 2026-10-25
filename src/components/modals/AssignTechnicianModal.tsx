@@ -350,24 +350,40 @@ export const AssignTechnicianModal: React.FC<AssignTechnicianModalProps> = ({
   // All products currently handled by this technician in their vehicle/custody
   const productsCurrentlyHandled = useMemo(() => {
     if (!selectedTechnician) return [];
-    return allInventory.filter(
-      (item) =>
-        !item.archived &&
-        (item.assignedTechnicianId === selectedTechnician.id ||
-          item.submittedByTechnicianId === selectedTechnician.id ||
-          item.closedByTechnicianId === selectedTechnician.id)
-    );
+    const techVan = (selectedTechnician.assignedVan || '').toLowerCase().trim();
+    return allInventory.filter((item) => {
+      if (item.archived) return false;
+      const isDirect =
+        item.assignedTechnicianId === selectedTechnician.id ||
+        item.submittedByTechnicianId === selectedTechnician.id ||
+        item.closedByTechnicianId === selectedTechnician.id;
+      if (isDirect) return true;
+      if (item.assignmentScope === 'INDIVIDUAL') return false;
+      const itemVan = (item.assignedVan || '').toLowerCase().trim();
+      return Boolean(
+        techVan &&
+        techVan !== 'unassigned vehicle' &&
+        itemVan &&
+        (itemVan === techVan || itemVan.includes(techVan) || techVan.includes(itemVan))
+      );
+    });
   }, [allInventory, selectedTechnician]);
 
   // Total on-hand stocks currently assigned and in van custody (uninstalled)
   const currentOnHandItems = useMemo(() => {
     if (!selectedTechnician) return [];
-    return productsCurrentlyHandled.filter(
-      (i) =>
-        i.assignedTechnicianId === selectedTechnician.id &&
+    const techVan = (selectedTechnician.assignedVan || '').toLowerCase().trim();
+    return productsCurrentlyHandled.filter((i) => {
+      const itemVan = (i.assignedVan || '').toLowerCase().trim();
+      const matchesTech =
+        i.assignedTechnicianId === selectedTechnician.id ||
+        Boolean(techVan && techVan !== 'unassigned vehicle' && itemVan && (itemVan === techVan || itemVan.includes(techVan) || techVan.includes(itemVan)));
+      return (
+        matchesTech &&
         (i.lifecycleStatus === 'ASSIGNED_RESERVED' || i.status === 'ASSIGNED') &&
         (i.verificationStatus === 'UNLINKED_READY' || !i.customerAccountNumber)
-    );
+      );
+    });
   }, [productsCurrentlyHandled, selectedTechnician]);
 
   const totalCurrentOnHandUnits = useMemo(() => {

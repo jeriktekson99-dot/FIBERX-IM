@@ -303,7 +303,6 @@ export const TechnicianHubView: React.FC<TechnicianHubViewProps> = ({
       // Tab filter
       if (equipmentTab === 'ASSIGNED') {
         const isAssigned =
-          item.assignedTechnicianId === selectedTech?.id &&
           (item.lifecycleStatus === 'ASSIGNED_RESERVED' || item.status === 'ASSIGNED') &&
           (item.verificationStatus === 'UNLINKED_READY' || !item.customerAccountNumber);
         if (!isAssigned) return false;
@@ -1080,7 +1079,6 @@ export const TechnicianHubView: React.FC<TechnicianHubViewProps> = ({
               {filteredEquipment.length > 0 ? (
                 filteredEquipment.map((item, idx) => {
                   const isAssignedVan =
-                    item.assignedTechnicianId === selectedTech.id &&
                     (item.lifecycleStatus === 'ASSIGNED_RESERVED' || item.status === 'ASSIGNED') &&
                     (item.verificationStatus === 'UNLINKED_READY' || !item.customerAccountNumber);
 

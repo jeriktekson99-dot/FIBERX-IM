@@ -392,9 +392,12 @@ export const ReceiveStockModal: React.FC<ReceiveStockModalProps> = ({
     setModelName(preset.modelName);
     setUnit(preset.defaultUnit);
     setDescription(preset.description);
-    if (preset.category === 'ACCESSORY' || preset.sku.includes('FAST-CON')) {
-      setIsNonBarcodedMaterial(false);
-    }
+    const isMaterial =
+      preset.category === 'ACCESSORY' ||
+      preset.sku.includes('FAST-CON') ||
+      preset.sku.includes('PATCH-FAST') ||
+      preset.category === 'PATCH_CORD';
+    setIsNonBarcodedMaterial(isMaterial);
   };
 
   const prevIsOpenRef = useRef(false);
@@ -466,6 +469,13 @@ export const ReceiveStockModal: React.FC<ReceiveStockModalProps> = ({
     (rawCode: string) => {
       const trimmed = rawCode.trim();
       if (!trimmed) return;
+
+      // Handle multi-token input (e.g. pasted blocks or scanner emitting whitespace/tabs)
+      const tokens = trimmed.split(/[\r\n,\t\s]+/).filter((t) => t.trim().length > 1);
+      if (tokens.length > 1) {
+        tokens.forEach((tok) => addCodeToBulkBatch(tok));
+        return;
+      }
 
       const cleanUpper = trimmed.toUpperCase();
       const now = Date.now();
@@ -661,7 +671,7 @@ export const ReceiveStockModal: React.FC<ReceiveStockModalProps> = ({
   // Commit Bulk Batch to Inventory
   const handleCommitBulkBatch = () => {
     if (scannedBatch.length === 0) {
-      setValidationError('Please scan or paste at least one barcode before committing.');
+      setValidationError('Please scan, enter, or add at least one item before committing.');
       return;
     }
 
@@ -669,10 +679,15 @@ export const ReceiveStockModal: React.FC<ReceiveStockModalProps> = ({
     const itemsToCommit: Omit<InventoryItem, 'id'>[] = scannedBatch.map((batchItem) => {
       const isMeterCat = batchItem.category === 'PATCH_CORD' || batchItem.category === 'FIBER_CABLE';
       const mLength = batchItem.lengthMeters || 1;
+      const isBatchMaterial =
+        batchItem.category === 'ACCESSORY' ||
+        batchItem.serialNumber.startsWith('LOT-') ||
+        isNonBarcodedMaterial;
+
       return {
-        serialNumber: batchItem.serialNumber,
+        serialNumber: isBatchMaterial && batchItem.serialNumber.startsWith('LOT-') ? '' : batchItem.serialNumber,
         macAddress: batchItem.macAddress,
-        sku: sku.trim().toUpperCase(),
+        sku: sku.trim().toUpperCase() || 'FX-HW',
         name: isMeterCat && batchItem.lengthMeters
           ? `${itemTitle.trim()} (${mLength}m)`
           : itemTitle.trim(),
@@ -683,11 +698,11 @@ export const ReceiveStockModal: React.FC<ReceiveStockModalProps> = ({
         lifecycleStatus: 'IN_STOCK',
         verificationStatus: 'UNLINKED_READY',
         status: 'IN_STOCK',
-        bypassBarcode: false,
-        quantity: batchItem.quantity || 1,
+        bypassBarcode: isBatchMaterial,
+        quantity: Math.max(1, batchItem.quantity || 1),
         lengthMeters: isMeterCat ? mLength : undefined,
-        unit: 'pcs',
-        storageBin: storageBin.trim(),
+        unit: isBatchMaterial ? unit : (isMeterCat ? 'meters' : 'pcs'),
+        storageBin: storageBin.trim() || 'Rack A-01',
         modelName: modelName.trim() || itemTitle.trim(),
         brand: brand.trim() || 'FiberX',
         receivedDate: today,
@@ -717,20 +732,23 @@ export const ReceiveStockModal: React.FC<ReceiveStockModalProps> = ({
       return;
     }
 
-    if (!isNonBarcodedMaterial && !manualCodeInput.trim()) {
-      setValidationError('Barcode / Serial Number or MAC Address is required.');
+    const effectiveNonBarcoded = isNonBarcodedMaterial || category === 'ACCESSORY' || !manualCodeInput.trim();
+
+    if (!effectiveNonBarcoded && !manualCodeInput.trim()) {
+      setValidationError('Barcode / Serial Number or MAC Address is required (or check "Non-barcoded material" for bulk supplies).');
       return;
     }
 
-    const { isMac, formatted, cleanSerial } = detectAndFormatMac(manualCodeInput.trim());
+    const cleanInput = manualCodeInput.trim();
+    const { isMac, formatted, cleanSerial } = detectAndFormatMac(cleanInput);
     const today = new Date().toISOString().split('T')[0];
     const computedSku = sku.trim()
       ? sku.trim().toUpperCase()
       : `FX-${itemTitle.slice(0, 4).toUpperCase().replace(/[^A-Z]/g, 'ITEM')}-${Math.floor(Math.random() * 900 + 100)}`;
 
     onReceive({
-      serialNumber: isNonBarcodedMaterial ? '' : cleanSerial,
-      macAddress: !isNonBarcodedMaterial && isMac ? formatted : undefined,
+      serialNumber: effectiveNonBarcoded && !cleanInput ? '' : cleanSerial,
+      macAddress: !effectiveNonBarcoded && isMac ? formatted : undefined,
       sku: computedSku,
       name: itemTitle.trim(),
       description: description.trim() || `${itemTitle} added manually by ${currentUser.name}`,
@@ -738,9 +756,9 @@ export const ReceiveStockModal: React.FC<ReceiveStockModalProps> = ({
       lifecycleStatus: 'IN_STOCK',
       verificationStatus: 'UNLINKED_READY',
       status: 'IN_STOCK',
-      bypassBarcode: isNonBarcodedMaterial,
+      bypassBarcode: effectiveNonBarcoded,
       quantity: Math.max(1, manualQuantity),
-      unit: isNonBarcodedMaterial ? unit : 'pcs',
+      unit: effectiveNonBarcoded ? unit : 'pcs',
       storageBin: storageBin.trim() || 'Rack A-01',
       modelName: modelName.trim() || itemTitle.trim(),
       brand: brand.trim() || 'FiberX',
@@ -1180,7 +1198,7 @@ export const ReceiveStockModal: React.FC<ReceiveStockModalProps> = ({
                   </button>
                 </div>
 
-                <div className="flex items-center justify-between text-[11px] text-teal-800">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-[11px] text-teal-800">
                   <span>
                     ⚡ <strong>Hardware Auto-Capture:</strong> Scanning appends directly to{' '}
                     <strong>{CATEGORY_LABELS[category]}</strong> queue below.
@@ -1191,6 +1209,25 @@ export const ReceiveStockModal: React.FC<ReceiveStockModalProps> = ({
                     </span>
                   )}
                 </div>
+
+                {(category === 'ACCESSORY' || category === 'PATCH_CORD' || isNonBarcodedMaterial) && (
+                  <div className="pt-2 border-t border-teal-200/70 flex flex-wrap items-center justify-between gap-2 text-xs">
+                    <div className="flex items-center gap-1.5 text-teal-900 font-medium">
+                      <span>Non-barcoded item / accessory?</span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const syntheticCode = `LOT-${sku || 'ACC'}-${Date.now().toString(36).toUpperCase()}`;
+                        addCodeToBulkBatch(syntheticCode);
+                      }}
+                      className="px-3 py-1.5 bg-teal-800 hover:bg-teal-900 text-white rounded-lg font-bold flex items-center gap-1.5 shadow-2xs transition-colors cursor-pointer"
+                    >
+                      <Plus className="w-3.5 h-3.5 text-teal-300" />
+                      <span>+ Add {itemTitle} to Batch Queue</span>
+                    </button>
+                  </div>
+                )}
               </div>
 
               {/* Scanned Batch Queue Table */}
